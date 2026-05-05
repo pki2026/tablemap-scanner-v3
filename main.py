@@ -27,6 +27,23 @@ TOKEN_CONFIDENCE = 95
 
 ACTION_WORDS = frozenset({"fold", "call", "raise", "check", "bet", "all-in"})
 
+# Namenskatalog aus Tablemap-Scanner V2 / PokerTH-Heuristik (OpenHoldem-orientiert).
+REGION_CATALOG: tuple[str, ...] = (
+    "game_id",
+    "hand_id",
+    "c0pot0",
+    "c0pot_total",
+    "c0pot_bets",
+    "c0smallblind",
+    "c0bigblind",
+    *tuple(f"p{i}name" for i in range(10)),
+    *tuple(f"p{i}balance" for i in range(10)),
+    *tuple(f"p{i}dealer" for i in range(10)),
+    *tuple(f"p{i}bet" for i in range(10)),
+    *tuple(f"i{i}label" for i in range(10)),
+)
+REGION_CATALOG_SET: frozenset[str] = frozenset(REGION_CATALOG)
+
 
 def _first_label_boundary(line: str) -> int:
     idx_colon = line.find(":")
@@ -132,6 +149,238 @@ def parse_clipboard_to_tokens(text: str) -> list[dict]:
     return tokens
 
 
+def token_full_text(t: dict) -> str:
+    lab = (t.get("label") or "").strip()
+    val = (t.get("value") or "").strip()
+    if lab == "__text__":
+        return val
+    if lab and val:
+        return f"{lab} {val}".strip()
+    return lab or val
+
+
+def _currency_display(t: dict) -> str:
+    """Reinen Geldbetrag aus Parser-Tokens (__money__ + Betrag)."""
+    lab = (t.get("label") or "").strip()
+    val = (t.get("value") or "").strip()
+    if lab == "__money__":
+        return val
+    return token_full_text(t).strip()
+
+
+def _money_value_follows(t: dict) -> bool:
+    val = (t.get("value") or "").strip()
+    if val.startswith("$"):
+        return True
+    return token_full_text(t).strip().startswith("$")
+
+
+def _extract_player_seat(full: str) -> int | None:
+    low = full.lower().strip()
+    if low.startswith("human player"):
+        return 0
+    m = re.search(r"player\s+(\d+)", low, re.IGNORECASE)
+    if not m:
+        return None
+    n = int(m.group(1))
+    if 1 <= n <= 10:
+        return n - 1
+    return None
+
+
+def _is_player_header_token(t: dict) -> bool:
+    low = token_full_text(t).strip().lower()
+    return low.startswith("player") or low.startswith("human player")
+
+
+def _small_blind_header(ft_low: str) -> bool:
+    return ft_low.startswith("small blind") or ft_low == "small blind"
+
+
+def _big_blind_header(ft_low: str) -> bool:
+    return ft_low.startswith("big blind") or ft_low == "big blind"
+
+
+def _total_header_pair(ft_low: str) -> bool:
+    return ft_low.rstrip(":").strip() == "total"
+
+
+def _bets_header_pair(ft_low: str) -> bool:
+    return ft_low.rstrip(":").strip() == "bets"
+
+
+def _total_bets_single_token(t: dict) -> tuple[str, str] | None:
+    lab = (t.get("label") or "").strip().lower().rstrip(":")
+    val = (t.get("value") or "").strip()
+    if lab == "total" and "$" in val:
+        return ("c0pot_total", val.strip())
+    if lab == "bets" and "$" in val:
+        return ("c0pot_bets", val.strip())
+    ft = token_full_text(t).strip()
+    low = ft.lower()
+    if low.startswith("total") and "$" in ft:
+        return ("c0pot_total", ft.strip())
+    if low.startswith("bets") and "$" in ft:
+        return ("c0pot_bets", ft.strip())
+    return None
+
+
+def _game_hand_match(t: dict) -> tuple[str, str] | None:
+    lab = (t.get("label") or "").strip().lower().rstrip(":")
+    val = (t.get("value") or "").strip()
+    if lab == "game" and re.fullmatch(r"\d+", val):
+        return ("game_id", val)
+    if lab == "hand" and re.fullmatch(r"\d+", val):
+        return ("hand_id", val)
+    ft = token_full_text(t).strip()
+    m = re.match(r"(?i)game\s*:\s*(\d+)\s*$", ft)
+    if m:
+        return ("game_id", m.group(1))
+    m = re.match(r"(?i)hand\s*:\s*(\d+)\s*$", ft)
+    if m:
+        return ("hand_id", m.group(1))
+    return None
+
+
+def _is_dealer_token(t: dict) -> bool:
+    ft = token_full_text(t).strip().lower().rstrip(":")
+    return ft == "dealer"
+
+
+def _button_display_label(t: dict) -> str | None:
+    lab = (t.get("label") or "").strip()
+    if lab and lab != "__text__":
+        low_lab = _norm_action_label(lab)
+        if low_lab in ACTION_WORDS:
+            return lab.strip()
+    ft = token_full_text(t).strip()
+    low_ft = _norm_action_label(ft)
+    if low_ft in ACTION_WORDS:
+        return ft.strip()
+    return None
+
+
+def _blind_region_from_single_line(ft: str) -> tuple[str, str] | None:
+    low = ft.lower()
+    if ("small blind" in low or low.startswith("small blind")) and "$" in ft:
+        return ("c0smallblind", ft.strip())
+    if ("big blind" in low or low.startswith("big blind")) and "$" in ft:
+        return ("c0bigblind", ft.strip())
+    return None
+
+
+def group_tokens_into_regions(tokens: list[dict]) -> tuple[list[dict], dict[str, int]]:
+    """Gruppiert Folgen von Roh-Tokens zu Poker-Regionen (Lesereihenfolge = Snipping Tool)."""
+    regions: list[dict] = []
+    assigned: set[str] = set()
+    consumed: set[int] = set()
+    dealer_pending = False
+    button_idx = 0
+
+    def emit(region_name: str, value: str) -> None:
+        if region_name in assigned:
+            return
+        assigned.add(region_name)
+        regions.append(
+            {
+                "region_name": region_name,
+                "value": value,
+                "catalog_match": region_name in REGION_CATALOG_SET,
+            }
+        )
+
+    n = len(tokens)
+    i = 0
+    while i < n:
+        if i in consumed:
+            i += 1
+            continue
+
+        t = tokens[i]
+        ft = token_full_text(t)
+        ft_low = ft.strip().lower()
+
+        single_blind = _blind_region_from_single_line(ft)
+        if single_blind:
+            rn, val = single_blind
+            emit(rn, val)
+            consumed.add(i)
+            i += 1
+            continue
+
+        tb = _total_bets_single_token(t)
+        if tb:
+            rn, val = tb
+            emit(rn, val)
+            consumed.add(i)
+            i += 1
+            continue
+
+        gh = _game_hand_match(t)
+        if gh:
+            rn, val = gh
+            emit(rn, val)
+            consumed.add(i)
+            i += 1
+            continue
+
+        if _is_dealer_token(t):
+            dealer_pending = True
+            consumed.add(i)
+            i += 1
+            continue
+
+        btn_lab = _button_display_label(t)
+        if btn_lab is not None:
+            emit(f"i{button_idx}label", btn_lab)
+            button_idx += 1
+            consumed.add(i)
+            i += 1
+            continue
+
+        if _is_player_header_token(t) and i + 1 < n and _money_value_follows(tokens[i + 1]):
+            seat = _extract_player_seat(ft)
+            if seat is not None:
+                stack_txt = _currency_display(tokens[i + 1])
+                emit(f"p{seat}name", ft.strip())
+                emit(f"p{seat}balance", stack_txt)
+                if dealer_pending:
+                    emit(f"p{seat}dealer", "1")
+                    dealer_pending = False
+                consumed.update((i, i + 1))
+                i += 2
+                continue
+
+        if i + 1 < n and _money_value_follows(tokens[i + 1]) and "$" not in ft:
+            nxt_val = _currency_display(tokens[i + 1])
+            if _small_blind_header(ft_low):
+                emit("c0smallblind", f"{ft.strip()} {nxt_val}".strip())
+                consumed.update((i, i + 1))
+                i += 2
+                continue
+            if _big_blind_header(ft_low):
+                emit("c0bigblind", f"{ft.strip()} {nxt_val}".strip())
+                consumed.update((i, i + 1))
+                i += 2
+                continue
+            if _total_header_pair(ft_low):
+                emit("c0pot_total", nxt_val)
+                consumed.update((i, i + 1))
+                i += 2
+                continue
+            if _bets_header_pair(ft_low):
+                emit("c0pot_bets", nxt_val)
+                consumed.update((i, i + 1))
+                i += 2
+                continue
+
+        i += 1
+
+    remaining_text = sum(1 for x in tokens if (x.get("label") or "") == "__text__")
+    stats = {"region_count": len(regions), "remaining_text_lines": remaining_text}
+    return regions, stats
+
+
 def kill_snipping_process(proc: subprocess.Popen | None) -> None:
     if proc is None:
         return
@@ -183,8 +432,15 @@ def main() -> int:
 
     root = tk.Tk()
     root.title("Tablemap Scanner V3")
-    root.geometry("520x120")
+    root.geometry("720x520")
+    root.minsize(560, 380)
     root.attributes("-topmost", True)
+
+    def _shutdown() -> None:
+        kill_snipping_process(proc)
+        root.destroy()
+
+    root.protocol("WM_DELETE_WINDOW", _shutdown)
 
     status = tk.Label(
         root,
@@ -192,12 +448,41 @@ def main() -> int:
             "Bitte Spielfeld im Snipping Tool markieren und "
             "'Text aus Bild kopieren' klicken."
         ),
-        wraplength=500,
+        wraplength=640,
         justify=tk.CENTER,
         padx=12,
         pady=12,
     )
-    status.pack(fill=tk.BOTH, expand=True)
+    status.pack(fill=tk.X)
+
+    def show_results(tokens: list[dict], regions: list[dict], stats: dict[str, int], out_path: Path) -> None:
+        status.pack_forget()
+        body = tk.Frame(root)
+        body.pack(fill=tk.BOTH, expand=True, padx=10, pady=8)
+        hdr = tk.Label(
+            body,
+            text=(
+                f"Tokens: {len(tokens)}   "
+                f"Regionen: {stats['region_count']}   "
+                f"Freie Textzeilen (__text__): {stats['remaining_text_lines']}\n"
+                f"Export: {out_path}"
+            ),
+            justify=tk.LEFT,
+            anchor="w",
+        )
+        hdr.pack(fill=tk.X)
+        scroll_wrap = tk.Frame(body)
+        scroll_wrap.pack(fill=tk.BOTH, expand=True, pady=(10, 0))
+        sb = tk.Scrollbar(scroll_wrap)
+        lb = tk.Listbox(scroll_wrap, height=22, width=96, yscrollcommand=sb.set, font=("Segoe UI", 10))
+        sb.config(command=lb.yview)
+        sb.pack(side=tk.RIGHT, fill=tk.Y)
+        lb.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        for r in regions:
+            mark = "*" if r["catalog_match"] else "?"
+            lb.insert(tk.END, f"{mark} {r['region_name']}  →  {r['value']}")
+        tk.Button(body, text="Schließen", command=_shutdown).pack(pady=(12, 4))
+
     root.update_idletasks()
     root.update()
 
@@ -227,6 +512,7 @@ def main() -> int:
         current = _normalize_clip(current_raw)
         if current and current != baseline:
             tokens = parse_clipboard_to_tokens(current)
+            regions, stats = group_tokens_into_regions(tokens)
             stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             out_path = out_dir / f"pokerth_tablemap_{stamp}.json"
             payload = {
@@ -234,19 +520,16 @@ def main() -> int:
                 "screenshot": str(screenshot_path),
                 "token_count": len(tokens),
                 "tokens": tokens,
+                "regions": regions,
+                "region_catalog": list(REGION_CATALOG),
+                "region_count": stats["region_count"],
+                "remaining_text_lines": stats["remaining_text_lines"],
             }
             out_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
-            status.config(
-                text=f"Daten aus Snipping Tool übernommen: {len(tokens)} Token(s)."
-            )
             session_done = True
             kill_snipping_process(proc)
-
-            def close_ui() -> None:
-                root.destroy()
-
-            root.after(2000, close_ui)
+            show_results(tokens, regions, stats, out_path)
             return
 
         root.after(POLL_INTERVAL_MS, on_poll)

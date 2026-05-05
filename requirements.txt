@@ -1,0 +1,2 @@
+# Tkinter ist Teil der Python-Standardbibliothek unter Windows (kein pip-Paket).
+pywin32>=306

@@ -1,2 +1,3 @@
-# Tkinter ist Teil der Python-Standardbibliothek unter Windows (kein pip-Paket).
+# pywin32 — Clipboard (win32clipboard / win32con)
 pywin32>=306
+# tkinter — Standardbibliothek unter Windows (kein pip-Paket)

@@ -25,6 +25,28 @@ TIMEOUT_S = 120
 TOKEN_BBOX = {"x": 0, "y": 0, "w": 100, "h": 20}
 TOKEN_CONFIDENCE = 95
 
+ACTION_WORDS = frozenset({"fold", "call", "raise", "check", "bet", "all-in"})
+
+
+def _first_label_boundary(line: str) -> int:
+    idx_colon = line.find(":")
+    idx_space = next((i for i, ch in enumerate(line) if ch.isspace()), -1)
+    candidates = [i for i in (idx_colon, idx_space) if i >= 0]
+    return min(candidates) if candidates else -1
+
+
+def _norm_action_label(s: str) -> str:
+    return s.strip().lower()
+
+
+def _make_token(label: str, value: str) -> dict:
+    return {
+        "label": label,
+        "value": value,
+        "bbox": dict(TOKEN_BBOX),
+        "confidence": TOKEN_CONFIDENCE,
+    }
+
 
 def _read_clipboard_text() -> str | None:
     try:
@@ -48,7 +70,8 @@ def _normalize_clip(s: str | None) -> str:
     return s.replace("\r\n", "\n").replace("\r", "\n")
 
 
-def parse_tokens(text: str) -> list[dict]:
+def parse_clipboard_to_tokens(text: str) -> list[dict]:
+    """Snipping-Tool-Zeilen parsen: Strikt-Modus (Doppelpunkt / Label $x) plus breite Heuristik."""
     tokens: list[dict] = []
     dollar_re = re.compile(r"^(.+?)\s+(\$.+)$")
 
@@ -57,33 +80,54 @@ def parse_tokens(text: str) -> list[dict]:
         if not line:
             continue
 
+        # Strikt: „Label: Wert“ (beide Teile nicht leer)
         if ":" in line:
-            label, _, rest = line.partition(":")
-            label = label.strip()
-            value = rest.strip()
-            if label and value:
-                tokens.append(
-                    {
-                        "label": label,
-                        "value": value,
-                        "bbox": dict(TOKEN_BBOX),
-                        "confidence": TOKEN_CONFIDENCE,
-                    }
-                )
-            continue
+            label_s, _, rest_s = line.partition(":")
+            label_s, rest_s = label_s.strip(), rest_s.strip()
+            if label_s and rest_s:
+                tokens.append(_make_token(label_s, rest_s))
+                continue
 
+        # Strikt: „Label $Wert“
         m = dollar_re.match(line)
         if m:
-            label, value = m.group(1).strip(), m.group(2).strip()
-            if label and value:
-                tokens.append(
-                    {
-                        "label": label,
-                        "value": value,
-                        "bbox": dict(TOKEN_BBOX),
-                        "confidence": TOKEN_CONFIDENCE,
-                    }
-                )
+            ls, vs = m.group(1).strip(), m.group(2).strip()
+            if ls and vs:
+                tokens.append(_make_token(ls, vs))
+                continue
+
+        # Heuristik: erstes Wort bis zum ersten ':' oder Whitespace, Rest = value
+        boundary = _first_label_boundary(line)
+        if boundary >= 0:
+            label_h = line[:boundary].strip()
+            value_h = line[boundary + 1 :].lstrip()
+        else:
+            label_h = line
+            value_h = ""
+
+        whole_norm = _norm_action_label(line)
+
+        # Numerisch / Betrag: '$' im Wertteil (oder eingeklebtes „BB$2“ ohne Leerzeichen)
+        if "$" in value_h:
+            tokens.append(_make_token(label_h or "__money__", value_h))
+            continue
+        if "$" in label_h and not value_h:
+            pre, _, post = label_h.partition("$")
+            lb = pre.strip() or "__money__"
+            vs = post.strip()
+            tokens.append(_make_token(lb, f"${vs}" if vs and not vs.startswith("$") else vs))
+            continue
+
+        # Aktions-Buttons (auch ohne Dollar)
+        if _norm_action_label(label_h) in ACTION_WORDS:
+            tokens.append(_make_token(label_h, value_h))
+            continue
+        if boundary < 0 and whole_norm in ACTION_WORDS:
+            tokens.append(_make_token(line.strip(), ""))
+            continue
+
+        # Übrige Zeilen als Freitext
+        tokens.append(_make_token("__text__", line))
 
     return tokens
 
@@ -182,7 +226,7 @@ def main() -> int:
         current_raw = _read_clipboard_text()
         current = _normalize_clip(current_raw)
         if current and current != baseline:
-            tokens = parse_tokens(current)
+            tokens = parse_clipboard_to_tokens(current)
             stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             out_path = out_dir / f"pokerth_tablemap_{stamp}.json"
             payload = {

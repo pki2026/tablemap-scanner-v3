@@ -87,12 +87,69 @@ def _normalize_clip(s: str | None) -> str:
     return s.replace("\r\n", "\n").replace("\r", "\n")
 
 
+_SOFT_MERGE_LINE = re.compile(r"^[A-Za-z][A-Za-z\s\-']{0,46}$")
+
+
+def _leading_ws_units(s: str) -> int:
+    """Vergleichbare Einrückung (Leerzeichen + Tab als 4)."""
+    u = 0
+    for ch in s:
+        if ch == " ":
+            u += 1
+        elif ch == "\t":
+            u += 4
+        else:
+            break
+    return u
+
+
+def _merge_lines_for_multiword_labels(lines: list[str]) -> list[str]:
+    """Führt Zeilen zusammen, die logisch eine Einheit bilden (SMALL+BLIND, stärkere Einrückung)."""
+    out: list[str] = []
+    i = 0
+    while i < len(lines):
+        raw = lines[i]
+        stripped = raw.strip()
+        low = stripped.lower()
+        if i + 1 < len(lines):
+            raw_n = lines[i + 1]
+            stripped_n = raw_n.strip()
+            low_n = stripped_n.lower()
+            if stripped and stripped_n and "$" not in stripped and "$" not in stripped_n:
+                if ":" not in stripped and ":" not in stripped_n:
+                    if low == "small" and low_n == "blind":
+                        out.append(f"{stripped} {stripped_n}")
+                        i += 2
+                        continue
+                    if low == "big" and low_n == "blind":
+                        out.append(f"{stripped} {stripped_n}")
+                        i += 2
+                        continue
+                    wi = _leading_ws_units(raw)
+                    wj = _leading_ws_units(raw_n)
+                    if (
+                        wj > wi
+                        and len(stripped) <= 48
+                        and len(stripped_n) <= 48
+                        and _SOFT_MERGE_LINE.fullmatch(stripped)
+                        and _SOFT_MERGE_LINE.fullmatch(stripped_n)
+                    ):
+                        out.append(f"{stripped} {stripped_n}")
+                        i += 2
+                        continue
+        out.append(raw.rstrip("\r"))
+        i += 1
+    return out
+
+
 def parse_clipboard_to_tokens(text: str) -> list[dict]:
     """Snipping-Tool-Zeilen parsen: Strikt-Modus (Doppelpunkt / Label $x) plus breite Heuristik."""
     tokens: list[dict] = []
     dollar_re = re.compile(r"^(.+?)\s+(\$.+)$")
 
-    for raw_line in text.split("\n"):
+    merged_lines = _merge_lines_for_multiword_labels(text.split("\n"))
+
+    for raw_line in merged_lines:
         line = raw_line.strip()
         if not line:
             continue
@@ -493,8 +550,8 @@ def main() -> int:
 
     root = tk.Tk()
     root.title("Tablemap Scanner V3")
-    root.geometry("720x520")
-    root.minsize(560, 380)
+    root.geometry("800x780")
+    root.minsize(620, 620)
     root.attributes("-topmost", True)
 
     def _shutdown() -> None:
@@ -516,7 +573,13 @@ def main() -> int:
     )
     status.pack(fill=tk.X)
 
-    def show_results(tokens: list[dict], regions: list[dict], stats: dict[str, int], out_path: Path) -> None:
+    def show_results(
+        tokens: list[dict],
+        regions: list[dict],
+        stats: dict[str, int],
+        out_path: Path,
+        clipboard_raw: str,
+    ) -> None:
         status.pack_forget()
         body = tk.Frame(root)
         body.pack(fill=tk.BOTH, expand=True, padx=10, pady=8)
@@ -532,17 +595,69 @@ def main() -> int:
             anchor="w",
         )
         hdr.pack(fill=tk.X)
+
+        tk.Label(body, text="Regionen", font=("Segoe UI", 10, "bold")).pack(anchor="w", pady=(10, 2))
         scroll_wrap = tk.Frame(body)
-        scroll_wrap.pack(fill=tk.BOTH, expand=True, pady=(10, 0))
+        scroll_wrap.pack(fill=tk.BOTH, expand=True, pady=(0, 4))
         sb = tk.Scrollbar(scroll_wrap)
-        lb = tk.Listbox(scroll_wrap, height=22, width=96, yscrollcommand=sb.set, font=("Segoe UI", 10))
+        lb = tk.Listbox(scroll_wrap, height=11, width=96, yscrollcommand=sb.set, font=("Segoe UI", 10))
         sb.config(command=lb.yview)
         sb.pack(side=tk.RIGHT, fill=tk.Y)
         lb.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         for r in regions:
             mark = "*" if r["catalog_match"] else "?"
             lb.insert(tk.END, f"{mark} {r['region_name']}  →  {r['value']}")
-        tk.Button(body, text="Schließen", command=_shutdown).pack(pady=(12, 4))
+
+        text_lines = [
+            token_full_text(t)
+            for t in tokens
+            if (t.get("label") or "").strip() == "__text__"
+        ]
+        tk.Label(body, text=f"__text__-Tokens ({len(text_lines)})", font=("Segoe UI", 10, "bold")).pack(
+            anchor="w", pady=(10, 2)
+        )
+        tf = tk.Frame(body)
+        tf.pack(fill=tk.BOTH, expand=False, pady=(0, 4))
+        tsb = tk.Scrollbar(tf)
+        ttxt = tk.Text(
+            tf,
+            height=6,
+            width=96,
+            wrap=tk.WORD,
+            font=("Segoe UI", 9),
+            yscrollcommand=tsb.set,
+            state=tk.DISABLED,
+        )
+        tsb.config(command=ttxt.yview)
+        tsb.pack(side=tk.RIGHT, fill=tk.Y)
+        ttxt.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        ttxt.config(state=tk.NORMAL)
+        ttxt.insert("1.0", "\n".join(text_lines) if text_lines else "(keine __text__-Tokens)")
+        ttxt.config(state=tk.DISABLED)
+
+        tk.Label(body, text="Rohdaten aus Snipping Tool", font=("Segoe UI", 10, "bold")).pack(
+            anchor="w", pady=(8, 2)
+        )
+        rf = tk.Frame(body)
+        rf.pack(fill=tk.BOTH, expand=True, pady=(0, 4))
+        rsb = tk.Scrollbar(rf)
+        rtx = tk.Text(
+            rf,
+            height=14,
+            width=96,
+            wrap=tk.WORD,
+            font=("Consolas", 9),
+            yscrollcommand=rsb.set,
+            state=tk.DISABLED,
+        )
+        rsb.config(command=rtx.yview)
+        rsb.pack(side=tk.RIGHT, fill=tk.Y)
+        rtx.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        rtx.config(state=tk.NORMAL)
+        rtx.insert("1.0", clipboard_raw if clipboard_raw.strip() else "(leer)")
+        rtx.config(state=tk.DISABLED)
+
+        tk.Button(body, text="Schließen", command=_shutdown).pack(pady=(10, 4))
 
     root.update_idletasks()
     root.update()
@@ -585,12 +700,13 @@ def main() -> int:
                 "region_catalog": list(REGION_CATALOG),
                 "region_count": stats["region_count"],
                 "remaining_text_lines": stats["remaining_text_lines"],
+                "clipboard_raw": current,
             }
             out_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
             session_done = True
             kill_snipping_process(proc)
-            show_results(tokens, regions, stats, out_path)
+            show_results(tokens, regions, stats, out_path, current)
             return
 
         root.after(POLL_INTERVAL_MS, on_poll)

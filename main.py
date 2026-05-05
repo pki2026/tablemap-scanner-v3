@@ -269,6 +269,61 @@ def _blind_region_from_single_line(ft: str) -> tuple[str, str] | None:
     return None
 
 
+def _find_next_unclaimed_money(tokens: list[dict], start: int, consumed: set[int], n: int) -> int | None:
+    """Nächster Token-Index mit Geldbetrag, der noch keiner Region zugeordnet ist."""
+    for j in range(start, n):
+        if j in consumed:
+            continue
+        if _money_value_follows(tokens[j]):
+            return j
+    return None
+
+
+def _try_resolve_blind(tokens: list[dict], i: int, consumed: set[int], n: int) -> tuple[str, str, list[int], int | None] | None:
+    """SMALL BLIND / BIG BLIND auch über zwei Zeilen; `$`-Betrag per Vorwärtssuche (nicht nur direkt folgend)."""
+    if i in consumed:
+        return None
+    t0 = tokens[i]
+    ft0 = token_full_text(t0).strip()
+    ft0_low = ft0.lower()
+    kind: str | None = None
+    end = i
+    hdr: str | None = None
+
+    if i + 1 < n and (i + 1) not in consumed:
+        ft1_low = token_full_text(tokens[i + 1]).strip().lower()
+        if ft0_low == "small" and ft1_low == "blind":
+            kind = "small"
+            end = i + 2
+            hdr = "SMALL BLIND"
+        elif ft0_low == "big" and ft1_low == "blind":
+            kind = "big"
+            end = i + 2
+            hdr = "BIG BLIND"
+
+    if kind is None and "$" not in ft0:
+        if _small_blind_header(ft0_low):
+            kind = "small"
+            end = i + 1
+            hdr = ft0.strip()
+        elif _big_blind_header(ft0_low):
+            kind = "big"
+            end = i + 1
+            hdr = ft0.strip()
+
+    if kind is None:
+        return None
+
+    rn = "c0smallblind" if kind == "small" else "c0bigblind"
+    money_j = _find_next_unclaimed_money(tokens, end, consumed, n)
+    header_idxs = list(range(i, end))
+    if money_j is not None:
+        val = f"{hdr} {_currency_display(tokens[money_j])}".strip()
+    else:
+        val = hdr
+    return (rn, val, header_idxs, money_j)
+
+
 def group_tokens_into_regions(tokens: list[dict]) -> tuple[list[dict], dict[str, int]]:
     """Gruppiert Folgen von Roh-Tokens zu Poker-Regionen (Lesereihenfolge = Snipping Tool)."""
     regions: list[dict] = []
@@ -277,9 +332,9 @@ def group_tokens_into_regions(tokens: list[dict]) -> tuple[list[dict], dict[str,
     dealer_pending = False
     button_idx = 0
 
-    def emit(region_name: str, value: str) -> None:
+    def emit(region_name: str, value: str) -> bool:
         if region_name in assigned:
-            return
+            return False
         assigned.add(region_name)
         regions.append(
             {
@@ -288,6 +343,7 @@ def group_tokens_into_regions(tokens: list[dict]) -> tuple[list[dict], dict[str,
                 "catalog_match": region_name in REGION_CATALOG_SET,
             }
         )
+        return True
 
     n = len(tokens)
     i = 0
@@ -326,6 +382,7 @@ def group_tokens_into_regions(tokens: list[dict]) -> tuple[list[dict], dict[str,
 
         if _is_dealer_token(t):
             dealer_pending = True
+            print("[tablemap] DEALER erkannt; Zuordnung beim nächsten Spieler-Paar (pXdealer).", flush=True)
             consumed.add(i)
             i += 1
             continue
@@ -345,24 +402,28 @@ def group_tokens_into_regions(tokens: list[dict]) -> tuple[list[dict], dict[str,
                 emit(f"p{seat}name", ft.strip())
                 emit(f"p{seat}balance", stack_txt)
                 if dealer_pending:
-                    emit(f"p{seat}dealer", "1")
+                    ok_dealer = emit(f"p{seat}dealer", "1")
+                    print(
+                        f"[tablemap] Dealer → Sitz {seat} (p{seat}dealer), gesetzt={ok_dealer}",
+                        flush=True,
+                    )
                     dealer_pending = False
                 consumed.update((i, i + 1))
                 i += 2
                 continue
 
+        br = _try_resolve_blind(tokens, i, consumed, n)
+        if br:
+            rn, val, header_idxs, money_j = br
+            ok = emit(rn, val)
+            consumed.update(header_idxs)
+            if ok and money_j is not None:
+                consumed.add(money_j)
+            i += 1
+            continue
+
         if i + 1 < n and _money_value_follows(tokens[i + 1]) and "$" not in ft:
             nxt_val = _currency_display(tokens[i + 1])
-            if _small_blind_header(ft_low):
-                emit("c0smallblind", f"{ft.strip()} {nxt_val}".strip())
-                consumed.update((i, i + 1))
-                i += 2
-                continue
-            if _big_blind_header(ft_low):
-                emit("c0bigblind", f"{ft.strip()} {nxt_val}".strip())
-                consumed.update((i, i + 1))
-                i += 2
-                continue
             if _total_header_pair(ft_low):
                 emit("c0pot_total", nxt_val)
                 consumed.update((i, i + 1))

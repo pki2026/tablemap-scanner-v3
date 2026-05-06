@@ -7,6 +7,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+import re
+from collections import defaultdict
 
 import cv2
 import numpy as np
@@ -255,53 +257,130 @@ def filter_boxes_for_mapping(
     return usable, ignored
 
 
-def _classify_mapping_confidence(n_tok: int, n_box: int) -> str:
-    if n_tok == 0 or n_box == 0:
-        return "none"
-    mx = max(n_tok, n_box)
-    gap = mx - min(n_tok, n_box)
-    if gap > max(5, int(0.22 * mx)):
-        return "low"
-    if gap > max(2, int(0.10 * mx)):
-        return "medium"
-    return "high"
+class _UnionFind:
+    def __init__(self, n: int) -> None:
+        self._p = list(range(n))
+        self._r = [0] * n
+
+    def find(self, x: int) -> int:
+        while self._p[x] != x:
+            self._p[x] = self._p[self._p[x]]
+            x = self._p[x]
+        return x
+
+    def union(self, a: int, b: int) -> None:
+        ra, rb = self.find(a), self.find(b)
+        if ra == rb:
+            return
+        if self._r[ra] < self._r[rb]:
+            ra, rb = rb, ra
+        self._p[rb] = ra
+        if self._r[ra] == self._r[rb]:
+            self._r[ra] += 1
 
 
-def map_ordered_tokens_to_boxes(
+def _merge_token_clusters_from_regions(regions: list[dict], n_tokens: int) -> _UnionFind:
+    """Verknüpft Tokens, die dieselbe sichtbare Box teilen können (name+balance, Multi-Index-Regionen)."""
+    uf = _UnionFind(n_tokens)
+    for r in regions:
+        sti = r.get("source_token_indices") or []
+        sti_i = [int(x) for x in sti if x is not None and 0 <= int(x) < n_tokens]
+        for k in range(1, len(sti_i)):
+            uf.union(sti_i[0], sti_i[k])
+
+    by_seat: dict[str, dict[str, list[int]]] = {}
+    for r in regions:
+        rn = r["region_name"]
+        m = re.match(r"^p([0-9])(name|balance)$", rn)
+        if not m:
+            continue
+        seat, kind = m.group(1), m.group(2)
+        sti = r.get("source_token_indices") or []
+        if not sti:
+            continue
+        t0 = int(sti[0])
+        if not (0 <= t0 < n_tokens):
+            continue
+        by_seat.setdefault(seat, {})[kind] = sti
+
+    for _seat, parts in by_seat.items():
+        name_ti = parts.get("name")
+        bal_ti = parts.get("balance")
+        if not name_ti or not bal_ti:
+            continue
+        a, b = int(name_ti[0]), int(bal_ti[0])
+        if 0 <= a < n_tokens and 0 <= b < n_tokens:
+            uf.union(a, b)
+    return uf
+
+
+def _sorted_token_clusters(uf: _UnionFind, n_tokens: int) -> list[list[int]]:
+    buckets: defaultdict[int, list[int]] = defaultdict(list)
+    for i in range(n_tokens):
+        buckets[uf.find(i)].append(i)
+    clusters = [sorted(v) for v in buckets.values()]
+    clusters.sort(key=lambda c: (c[0], len(c)))
+    return clusters
+
+
+def map_tokens_to_boxes_many_to_one(
     tokens: list[dict],
+    regions: list[dict],
     usable_boxes: list[dict],
 ) -> dict:
-    """1:1 in Clipboard-/Token-Reihenfolge zu sortierten Boxen; bei low confidence kein Map."""
-    ordered = sorted(tokens, key=lambda t: int(t.get("token_index", -1)))
-    n_t, n_b = len(ordered), len(usable_boxes)
-    conf = _classify_mapping_confidence(n_t, n_b)
+    """
+    Many-to-one: beliebig viele Tokens pro Snipping-Box (z. B. p*name + p*balance).
+    Tokenzahl != Boxzahl führt nicht zu niedriger Confidence.
+    """
+    n_t = len(tokens)
+    n_b = len(usable_boxes)
+    token_box_map: dict[str, int] = {}
     unmatched_tokens: list[int] = []
     unmatched_boxes: list[int] = []
-    token_box_map: dict[str, int] = {}
 
-    if conf in ("none", "low"):
-        unmatched_tokens = [int(t["token_index"]) for t in ordered]
+    if n_t == 0 or n_b == 0:
+        if n_t:
+            unmatched_tokens = [int(t.get("token_index", i)) for i, t in enumerate(tokens)]
         unmatched_boxes = [int(b["box_index"]) for b in usable_boxes]
         return {
             "token_box_map": token_box_map,
-            "mapping_confidence": conf,
+            "mapping_confidence": "none",
             "unmatched_tokens": unmatched_tokens,
             "unmatched_boxes": unmatched_boxes,
+            "forced_cluster_merges": 0,
         }
 
-    k = min(n_t, n_b)
-    for j in range(k):
-        token_box_map[str(int(ordered[j]["token_index"]))] = int(usable_boxes[j]["box_index"])
-    if n_t > k:
-        unmatched_tokens = [int(ordered[j]["token_index"]) for j in range(k, n_t)]
-    if n_b > k:
-        unmatched_boxes = [int(usable_boxes[j]["box_index"]) for j in range(k, n_b)]
+    uf = _merge_token_clusters_from_regions(regions, n_t)
+    clusters = _sorted_token_clusters(uf, n_t)
+    forced = 0
+    while len(clusters) > n_b:
+        clusters[-2].extend(clusters[-1])
+        clusters[-2].sort()
+        clusters.pop()
+        forced += 1
+
+    for ci, clust in enumerate(clusters):
+        if ci >= n_b:
+            unmatched_tokens.extend(clust)
+            continue
+        bi = int(usable_boxes[ci]["box_index"])
+        for tidx in clust:
+            token_box_map[str(int(tidx))] = bi
+
+    for j in range(len(clusters), n_b):
+        unmatched_boxes.append(int(usable_boxes[j]["box_index"]))
+
+    if forced > 0:
+        conf = "medium"
+    else:
+        conf = "high"
 
     return {
         "token_box_map": token_box_map,
         "mapping_confidence": conf,
-        "unmatched_tokens": unmatched_tokens,
+        "unmatched_tokens": sorted(set(unmatched_tokens)),
         "unmatched_boxes": unmatched_boxes,
+        "forced_cluster_merges": forced,
     }
 
 
@@ -310,10 +389,10 @@ def build_region_boxes(
     mapping: dict,
     boxes_by_index: dict[int, dict],
 ) -> list[dict]:
-    """Region → erste source_token_index → box; nur bei mapping_confidence „high“ als matched."""
+    """Region → source_token_index → box; matched bei high/medium (Token↔Box-Map vorhanden)."""
     conf = mapping.get("mapping_confidence", "none")
     tbm: dict[str, int] = mapping.get("token_box_map") or {}
-    allow_match = conf == "high"
+    allow_match = conf in ("high", "medium")
     out: list[dict] = []
     for r in regions:
         rn = r["region_name"]
@@ -331,12 +410,17 @@ def build_region_boxes(
         if not allow_match or not sti:
             out.append(entry)
             continue
-        t0 = sti[0]
-        sid = str(int(t0))
-        if sid not in tbm:
+        box_ids: list[int] = []
+        for tx in sti:
+            sid = str(int(tx))
+            if sid not in tbm:
+                box_ids = []
+                break
+            box_ids.append(int(tbm[sid]))
+        if not box_ids or len(set(box_ids)) != 1:
             out.append(entry)
             continue
-        bi = int(tbm[sid])
+        bi = box_ids[0]
         boxd = boxes_by_index.get(bi)
         if not boxd:
             out.append(entry)

@@ -581,11 +581,18 @@ def main() -> int:
         clipboard_raw: str,
     ) -> None:
         print("[V3] show_results: building GUI", flush=True)
-        # Größe zuerst setzen, damit nach pack_forget kein „kollabiertes“ Fenster entsteht.
-        root.geometry("800x780")
-        root.minsize(620, 620)
-        wait_frame.pack_forget()
-        body = tk.Frame(root)
+        results_window = tk.Toplevel(root)
+        results_window.title("Tablemap Scanner V3 - Ergebnisse")
+        results_window.geometry("800x780")
+        results_window.minsize(620, 620)
+        results_window.transient(root)
+
+        def _close_results_only() -> None:
+            results_window.destroy()
+
+        results_window.protocol("WM_DELETE_WINDOW", _close_results_only)
+
+        body = tk.Frame(results_window)
         body.pack(fill=tk.BOTH, expand=True, padx=10, pady=8)
         hdr = tk.Label(
             body,
@@ -661,13 +668,13 @@ def main() -> int:
         rtx.insert("1.0", clipboard_raw if clipboard_raw.strip() else "(leer)")
         rtx.config(state=tk.DISABLED)
 
-        tk.Button(body, text="Beenden", command=_shutdown).pack(pady=(10, 4))
-        root.update_idletasks()
-        root.update()
-        root.deiconify()
-        root.lift()
+        tk.Button(body, text="Fenster schließen", command=_close_results_only).pack(pady=(10, 4))
+        results_window.update_idletasks()
+        results_window.update()
+        results_window.deiconify()
+        results_window.lift()
         try:
-            root.focus_force()
+            results_window.focus_force()
         except tk.TclError as exc:
             print("[V3][WARN] focus_force failed:", repr(exc), flush=True)
         print("[V3] show_results returned / GUI built", flush=True)
@@ -677,8 +684,8 @@ def main() -> int:
             child.destroy()
 
     def process_clipboard_and_show() -> None:
-        nonlocal session_done, clipboard_text, _processing_results
-        if _processing_results or session_done or not clipboard_text:
+        nonlocal clipboard_text, _processing_results
+        if _processing_results or not clipboard_text:
             print(
                 "[V3] process_clipboard_and_show skipped:",
                 f"_processing_results={_processing_results}",
@@ -716,7 +723,7 @@ def main() -> int:
             print("[V3] calling show_results", flush=True)
             show_results(tokens, regions, stats, out_path, current)
             print("[V3] show_results finished (after build)", flush=True)
-            session_done = True
+            build_state3_processed()
         except Exception as exc:
             print("[V3][ERROR]", repr(exc), flush=True)
             traceback.print_exc()
@@ -781,6 +788,25 @@ def main() -> int:
             side=tk.LEFT, padx=8
         )
         tk.Button(btn_row, text="Abbrechen / Beenden", command=_shutdown).pack(side=tk.LEFT, padx=8)
+
+    def build_state3_processed() -> None:
+        _clear_wait_inner()
+        tk.Label(wait_inner, text="Tablemap Scanner V3", font=("Segoe UI", 11, "bold")).pack(
+            anchor=tk.CENTER, pady=(0, 6)
+        )
+        tk.Label(
+            wait_inner,
+            text="Daten wurden verarbeitet.",
+            wraplength=460,
+            justify=tk.CENTER,
+        ).pack(anchor=tk.CENTER, pady=(0, 4))
+        tk.Label(
+            wait_inner,
+            text="Das Ergebnisfenster ist geöffnet.",
+            wraplength=460,
+            justify=tk.CENTER,
+        ).pack(anchor=tk.CENTER, pady=(0, 14))
+        tk.Button(wait_inner, text="Beenden", command=_shutdown).pack(anchor=tk.CENTER)
 
     build_state1()
 

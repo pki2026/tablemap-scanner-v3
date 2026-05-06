@@ -1,5 +1,6 @@
 """
-Desktop-Overlay: Ankerbereich über dem sichtbaren Tisch markieren und als Patch speichern.
+Echtes Desktop-Overlay: Vollbild, topmost, halbtransparent — roter Rahmen liegt über dem Tisch.
+Separates kleines Bedienfenster nur für [Anker speichern] / [Abbrechen].
 """
 
 from __future__ import annotations
@@ -29,12 +30,26 @@ def _safe_grab_release(w: tk.Misc) -> None:
         pass
 
 
+def _destroy_pair(overlay: tk.Toplevel, toolbar: tk.Toplevel | None) -> None:
+    _safe_grab_release(overlay)
+    if toolbar is not None:
+        _safe_grab_release(toolbar)
+        try:
+            toolbar.destroy()
+        except tk.TclError:
+            pass
+    try:
+        overlay.destroy()
+    except tk.TclError:
+        pass
+
+
 def run_anchor_calibration_blocking(root: tk.Tk, *, modal: bool = True) -> bool:
     """
-    Großes topmost Fenster (maximiert): Rahmen in Bildschirmkoordinaten des Canvas.
-    Speichern: Fenster ausblenden, ImageGrab des gewählten Rechtecks, PNG + JSON.
+    Vollbild-Overlay (Desktop), Rahmen in Bildschirmkoordinaten.
+    Kleines Topmost-Bedienfenster nur für Speichern/Abbrechen.
     """
-    print("[V3] anchor calibration: desktop overlay", flush=True)
+    print("[V3] anchor calibration: true desktop overlay", flush=True)
 
     result: dict[str, bool] = {"saved": False, "closing": False}
 
@@ -43,90 +58,57 @@ def run_anchor_calibration_blocking(root: tk.Tk, *, modal: bool = True) -> bool:
         sh_i = int(root.winfo_screenheight())
         print(f"[V3] overlay: screen size {sw_i}x{sh_i}", flush=True)
 
-        dlg = tk.Toplevel(root)
-        dlg.transient(root)
-        dlg.title("Tablemap Scanner V3 — Anker setzen")
-        dlg.attributes("-topmost", True)
+        overlay = tk.Toplevel(root)
 
-        # Topmost mit Titelleiste und Schließen-Kreuz (kein overrideredirect).
-        geom_set = False
+        overlay.overrideredirect(True)
+        overlay.geometry(f"{sw_i}x{sh_i}+0+0")
+        overlay.attributes("-topmost", True)
         try:
-            dlg.state("zoomed")
-            geom_set = True
-            print("[V3] overlay: geometry zoomed (maximiert)", flush=True)
+            overlay.attributes("-alpha", 0.22)
+            print("[V3] overlay: fullscreen transparent (alpha)", flush=True)
         except tk.TclError:
-            pass
-        if not geom_set:
-            dlg.geometry(f"{sw_i}x{sh_i}+0+0")
-            print(f"[V3] overlay: geometry {sw_i}x{sh_i}+0+0", flush=True)
+            print("[V3] overlay: alpha not supported, using opaque base", flush=True)
 
-        wf = tk.Frame(dlg)
-        wf.pack(fill=tk.BOTH, expand=True)
-
-        hint = tk.Label(
-            wf,
-            text=(
-                "Anker: roten Rahmen über den PokerTH-Tisch legen.\n"
-                "Verschieben: innen ziehen   |   Skalieren: blauer Griff rechts unten"
-            ),
-            bg="#101010",
-            fg="#ffffff",
-            font=("Segoe UI", 10),
-            justify=tk.CENTER,
-        )
-        hint.pack(fill=tk.X)
-
-        cv_wrap = tk.Frame(wf)
-        cv_wrap.pack(fill=tk.BOTH, expand=True)
+        overlay.configure(bg="#000000")
 
         canvas = tk.Canvas(
-            cv_wrap,
+            overlay,
+            width=sw_i,
+            height=sh_i,
             highlightthickness=0,
-            bg="#353535",
+            bd=0,
+            bg="#000000",
         )
-        canvas.pack(fill=tk.BOTH, expand=True)
+        canvas.place(x=0, y=0, width=sw_i, height=sh_i)
 
-        bf = tk.Frame(wf, bg="#101010")
-        bf.pack(fill=tk.X, side=tk.BOTTOM)
-        tk.Label(
-            bf,
-            text="Nullpunkt: oben links am roten Rahmen (0,0)   |   Skalieren: blau unten rechts",
-            fg="#bbbbbb",
-            bg="#101010",
-            font=("Segoe UI", 9),
-        ).pack()
+        tw, th = 460, 72
+        tx = max(0, (sw_i - tw) // 2)
+        ty = max(0, sh_i - th - 16)
+
+        toolbar = tk.Toplevel(root)
+        toolbar.title("Anker — Bedienung")
+        toolbar.attributes("-topmost", True)
+        toolbar.resizable(False, False)
+        toolbar.geometry(f"{tw}x{th}+{tx}+{ty}")
+        toolbar.configure(bg="#101010")
+        bf = tk.Frame(toolbar, bg="#101010", padx=10, pady=10)
+        bf.pack(fill=tk.BOTH, expand=True)
         btn_row = tk.Frame(bf, bg="#101010")
-        btn_row.pack(pady=6)
+        btn_row.pack()
 
+        print("[V3] overlay: geometry fullscreen +0+0 (no title bar)", flush=True)
+        print("[V3] overlay: separate toolbar window", flush=True)
         print("[V3] overlay: widgets created", flush=True)
 
-        def canvas_dims() -> tuple[int, int]:
-            dlg.update_idletasks()
-            cw = max(320, int(canvas.winfo_width()))
-            ch = max(240, int(canvas.winfo_height()))
-            return cw, ch
-
-        def clamp_rect(x_: float, y_: float, w_: float, h_: float) -> tuple[int, int, int, int]:
-            cw, ch = canvas_dims()
-            w_i, h_i = max(16, min(int(w_), cw)), max(16, min(int(h_), ch))
-            xi, yi = int(x_), int(y_)
-            if xi + w_i > cw:
-                xi = cw - w_i
-            if yi + h_i > ch:
-                yi = ch - h_i
-            xi, yi = max(0, xi), max(0, yi)
-            return xi, yi, w_i, h_i
-
         HANDLE = 18
-        rect_id: int
-        br_id: int
-        br_diag1: int
-        br_diag2: int
-        origin_cross_h: int
-        origin_cross_v: int
-        origin_ring: int
-        origin_label: int
-
+        rect_id = 0
+        br_id = 0
+        br_diag1 = 0
+        br_diag2 = 0
+        origin_cross_h = 0
+        origin_cross_v = 0
+        origin_ring = 0
+        origin_label = 0
         ORIGIN_ARM = 10
 
         state: dict[str, float | int | str] = {
@@ -141,14 +123,24 @@ def run_anchor_calibration_blocking(root: tk.Tk, *, modal: bool = True) -> bool:
             "h": 300,
         }
 
+        def clamp_rect(x_: float, y_: float, w_: float, h_: float) -> tuple[int, int, int, int]:
+            cw, ch = sw_i, sh_i
+            w_i, h_i = max(16, min(int(w_), cw)), max(16, min(int(h_), ch))
+            xi, yi = int(x_), int(y_)
+            if xi + w_i > cw:
+                xi = cw - w_i
+            if yi + h_i > ch:
+                yi = ch - h_i
+            xi, yi = max(0, xi), max(0, yi)
+            return xi, yi, w_i, h_i
+
         def init_rect_from_canvas() -> None:
             nonlocal rect_id, br_id, br_diag1, br_diag2
             nonlocal origin_cross_h, origin_cross_v, origin_ring, origin_label
-            cw, ch = canvas_dims()
-            rw_des = min(520, max(160, cw - 80))
-            rh_des = min(380, max(120, ch - 100))
-            ix0 = max(24, (cw - rw_des) // 2)
-            iy0 = max(40, (ch - rh_des) // 3)
+            rw_des = min(520, max(160, sw_i - 80))
+            rh_des = min(380, max(120, sh_i - 120))
+            ix0 = max(24, (sw_i - rw_des) // 2)
+            iy0 = max(40, (sh_i - rh_des) // 3)
             rect_id = canvas.create_rectangle(
                 ix0, iy0, ix0 + rw_des, iy0 + rh_des, outline="#ff2020", width=4
             )
@@ -159,7 +151,7 @@ def run_anchor_calibration_blocking(root: tk.Tk, *, modal: bool = True) -> bool:
             origin_cross_v = canvas.create_line(0, 0, 0, 0, fill="#00c853", width=3)
             origin_ring = canvas.create_oval(0, 0, 0, 0, outline="#004d1a", width=2, fill="#b9f6ca")
             origin_label = canvas.create_text(
-                0, 0, text="0,0", anchor=tk.NW, fill="#b9f6ca", font=("Segoe UI", 9, "bold")
+                0, 0, text="0,0", anchor=tk.NW, fill="#00ff88", font=("Segoe UI", 10, "bold")
             )
             wx0, wy0, ww0, hh0 = canvas_rect_to_xywh_inner()
             canvas.coords(rect_id, wx0, wy0, wx0 + ww0, wy0 + hh0)
@@ -239,7 +231,7 @@ def run_anchor_calibration_blocking(root: tk.Tk, *, modal: bool = True) -> bool:
 
         _initialized = {"ok": False}
 
-        def on_first_map(_ev: tk.Event | None = None) -> None:
+        def on_overlay_map(_ev: tk.Event | None = None) -> None:
             if _initialized["ok"]:
                 return
             _initialized["ok"] = True
@@ -249,24 +241,20 @@ def run_anchor_calibration_blocking(root: tk.Tk, *, modal: bool = True) -> bool:
             canvas.bind("<ButtonPress-1>", on_canvas_down)
             canvas.bind("<B1-Motion>", on_canvas_motion)
             canvas.bind("<ButtonRelease-1>", on_canvas_release)
-            print("[V3] overlay: visible", flush=True)
+            print("[V3] overlay: visible (desktop frame ready)", flush=True)
 
         def close_cancel() -> None:
             if result["closing"]:
                 return
             result["closing"] = True
             print("[V3] anchor calibration: cancelled", flush=True)
-            _safe_grab_release(dlg)
-            try:
-                dlg.destroy()
-            except tk.TclError:
-                pass
+            _destroy_pair(overlay, toolbar)
 
         def save_anchor() -> None:
             ix, iy, w_, h_ = canvas_rect_to_xywh_inner()
             if w_ < 8 or h_ < 8:
                 messagebox.showwarning(
-                    "Anker", "Bereich zu klein (min. ca. 8×8 Pixel).", parent=dlg
+                    "Anker", "Bereich zu klein (min. ca. 8×8 Pixel).", parent=toolbar
                 )
                 return
             cx0 = int(canvas.winfo_rootx())
@@ -278,7 +266,8 @@ def run_anchor_calibration_blocking(root: tk.Tk, *, modal: bool = True) -> bool:
             x1, y1, x2, y2 = left, top, right_ex - 1, bottom_ex - 1
             print(f"[V3] anchor calibration: grab screen bbox left={left} top={top} w={w_} h={h_}", flush=True)
             try:
-                dlg.withdraw()
+                overlay.withdraw()
+                toolbar.withdraw()
                 root.update_idletasks()
                 root.update()
                 time.sleep(0.15)
@@ -290,11 +279,12 @@ def run_anchor_calibration_blocking(root: tk.Tk, *, modal: bool = True) -> bool:
                 traceback.print_exc()
                 print(f"[V3][ERROR] anchor grab failed: {ex}", flush=True)
                 try:
-                    dlg.deiconify()
+                    overlay.deiconify()
+                    toolbar.deiconify()
                 except tk.TclError:
                     pass
                 try:
-                    messagebox.showerror("Anker", f"Screenshot fehlgeschlagen:\n{ex}", parent=root)
+                    messagebox.showerror("Anker", f"Screenshot fehlgeschlagen:\n{ex}", parent=toolbar)
                 except tk.TclError:
                     pass
                 return
@@ -325,45 +315,42 @@ def run_anchor_calibration_blocking(root: tk.Tk, *, modal: bool = True) -> bool:
                 traceback.print_exc()
                 print(f"[V3][ERROR] anchor save failed: {ex}", flush=True)
                 try:
-                    messagebox.showerror("Anker", f"Speichern fehlgeschlagen:\n{ex}", parent=root)
+                    messagebox.showerror("Anker", f"Speichern fehlgeschlagen:\n{ex}", parent=toolbar)
                 except tk.TclError:
                     pass
                 try:
-                    dlg.deiconify()
+                    overlay.deiconify()
+                    toolbar.deiconify()
                 except tk.TclError:
                     pass
                 return
 
             result["saved"] = True
             result["closing"] = True
-            _safe_grab_release(dlg)
-            try:
-                dlg.destroy()
-            except tk.TclError:
-                pass
+            _destroy_pair(overlay, toolbar)
 
-        tk.Button(btn_row, text="Abbrechen", command=close_cancel, width=14).pack(side=tk.LEFT, padx=8)
-        tk.Button(btn_row, text="Anker speichern", command=save_anchor, width=16).pack(side=tk.LEFT, padx=8)
+        tk.Button(btn_row, text="Abbrechen", command=close_cancel, width=12).pack(side=tk.LEFT, padx=6)
+        tk.Button(btn_row, text="Anker speichern", command=save_anchor, width=16).pack(side=tk.LEFT, padx=6)
 
-        dlg.protocol("WM_DELETE_WINDOW", close_cancel)
+        toolbar.protocol("WM_DELETE_WINDOW", close_cancel)
 
-        dlg.bind("<Map>", on_first_map)
+        overlay.bind("<Map>", on_overlay_map)
 
         root.update_idletasks()
         root.update()
-        dlg.update_idletasks()
-        dlg.update()
-        dlg.deiconify()
-        dlg.lift()
+        overlay.deiconify()
+        overlay.lift()
+        toolbar.deiconify()
+        toolbar.lift()
         try:
-            dlg.focus_force()
+            toolbar.focus_force()
         except Exception:
             pass
 
-        print("[V3] overlay: entering mainloop/wait_window", flush=True)
+        print("[V3] overlay: entering wait_window", flush=True)
 
         if modal:
-            dlg.wait_window()
+            overlay.wait_window()
 
         print("[V3] overlay: wait_window returned", flush=True)
         return bool(result.get("saved"))

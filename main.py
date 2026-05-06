@@ -10,6 +10,7 @@ import re
 import subprocess
 import sys
 import traceback
+from collections.abc import Iterable
 from datetime import datetime
 from pathlib import Path
 
@@ -43,6 +44,153 @@ REGION_CATALOG: tuple[str, ...] = (
     *tuple(f"i{i}label" for i in range(10)),
 )
 REGION_CATALOG_SET: frozenset[str] = frozenset(REGION_CATALOG)
+_REGION_CATALOG_INDEX = {r: i for i, r in enumerate(REGION_CATALOG)}
+
+
+_C0_BUCKET_ORDER = {
+    "c0pot_total": 0,
+    "c0pot_bets": 1,
+    "c0smallblind": 2,
+    "c0bigblind": 3,
+    "c0pot0": 4,
+}
+
+
+_PLAYER_SUFFIX_ORDER = {
+    "name": 0,
+    "balance": 1,
+    "bet": 2,
+    "dealer": 3,
+    "action": 4,
+    "cards": 5,
+}
+
+
+_HERO_BUTTON_SIZING_ORDER = {
+    "betsize_hero": 0,
+    "raisesize_hero": 1,
+    "callsize_hero": 2,
+}
+
+
+_OWN_RESULTS_LINE_PATTERN = re.compile(
+    r"aktuell.{0,300}?zuerst\s*:\s*Scan\b.{0,300}?zuletzt\s*:\s*Scan\b.{0,300}?Treffer",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+_OWN_MARKER_STRONG = ("→ aktuell:",)
+
+
+_OWN_MARKER_WEAK_CI = frozenset(
+    {
+        "-> aktuell:",
+        "zuerst: scan",
+        "zuletzt: scan",
+        "treffer:",
+        "gesamt-stats-historie",
+        "detail-historie pro region",
+        "aggregierte regionen",
+        "__text__-tokens letzter scan",
+        "scan-historie (kurz)",
+        "rohdaten letzter scan",
+        "tablemap scanner v3 - ergebnisse",
+    }
+)
+
+
+def region_sort_key(region_name: str) -> tuple:
+    """Priorität: Meta → Pot/Blinds → Board → Hero-Hole → Spieler nach Sitz → Buttons → Sizes → Catalog → Sonstiges."""
+    name = region_name
+
+    if name == "game_id":
+        return (100, 0, 0, "", name)
+    if name == "hand_id":
+        return (100, 1, 0, "", name)
+    if name == "street":
+        return (100, 2, 0, "", name)
+
+    if name.startswith("c0"):
+        if name in _C0_BUCKET_ORDER:
+            return (200, _C0_BUCKET_ORDER[name], 0, "", name)
+        return (260, hash(name) % (10**9), 0, name.lower(), name)
+
+    bm = re.fullmatch(r"board_card_(\d+)", name)
+    if bm:
+        return (300, int(bm.group(1)), 0, "", name)
+
+    fm = re.fullmatch(r"flop_card_(\d+)", name)
+    if fm:
+        return (310, int(fm.group(1)), 0, "", name)
+
+    if name == "turn_card":
+        return (311, 0, 0, "", name)
+    if name == "river_card":
+        return (312, 0, 0, "", name)
+
+    hm = re.fullmatch(r"hero_card_(\d+)", name)
+    if hm:
+        return (400, int(hm.group(1)), 0, "", name)
+
+    pm = re.fullmatch(r"p(\d+)(.+)", name)
+    if pm:
+        seat = int(pm.group(1))
+        suffix = pm.group(2)
+        suf_key = _PLAYER_SUFFIX_ORDER.get(suffix, 500)
+        return (500, seat, suf_key, suffix, name)
+
+    im = re.fullmatch(r"i(\d+)(\w*)", name)
+    if im:
+        sid = int(im.group(1))
+        suf = im.group(2) or ""
+        irank = 0 if suf == "label" else 100 + ord(suf[0]) if suf else 200
+        return (600, sid, irank, suf, name)
+
+    if name in _HERO_BUTTON_SIZING_ORDER:
+        return (650, _HERO_BUTTON_SIZING_ORDER[name], 0, "", name)
+
+    if name in REGION_CATALOG_SET:
+        return (700, _REGION_CATALOG_INDEX[name], 0, "", name)
+
+    return (9000, 0, 0, "", name.lower())
+
+
+def sorted_region_names(names: Iterable[str]) -> list[str]:
+    return sorted(frozenset(names), key=region_sort_key)
+
+
+def looks_like_own_results_text(clipboard_text: str) -> bool:
+    """Erkennt typischen Text aus dem Tk-Ergebnisfenster, um Fehl-Scans zu vermeiden."""
+    if not clipboard_text.strip():
+        return False
+
+    low = clipboard_text.lower()
+    weak_hits = sum(1 for m in _OWN_MARKER_WEAK_CI if m in low)
+    arrow_aktuell = any(s in clipboard_text for s in _OWN_MARKER_STRONG)
+    ascii_aktuell = "-> aktuell:" in low
+
+    if _OWN_RESULTS_LINE_PATTERN.search(clipboard_text):
+        return True
+
+    if weak_hits >= 3:
+        return True
+
+    for line in clipboard_text.replace("\r\n", "\n").split("\n"):
+        ls = line.strip()
+        if "→ aktuell:" in ls or "-> aktuell:" in ls.lower():
+            zfirst = bool(re.search(r"zuerst:\s*Scan\s+", ls, re.IGNORECASE))
+            zlast = bool(re.search(r"zuletzt:\s*Scan\s+", ls, re.IGNORECASE))
+            treff = "treffer" in ls.lower()
+            if zfirst and zlast and treff:
+                return True
+
+    if (arrow_aktuell or ascii_aktuell) and weak_hits >= 1:
+        return True
+
+    if weak_hits >= 2 and ("scan" in low and "|" in clipboard_text):
+        return True
+
+    return False
 
 
 def _first_label_boundary(line: str) -> int:
@@ -766,17 +914,21 @@ def main() -> int:
 
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         out_path = out_dir / f"pokerth_tablemap_aggregate_{stamp}.json"
-        regions_flat = {name: d["value"] for name, d in aggregate_by_region.items()}
+        order = sorted_region_names(aggregate_by_region.keys())
+        regions_flat = {name: aggregate_by_region[name]["value"] for name in order}
         regions_detail = [
             {
                 "region_name": name,
-                "value": d["value"],
-                "catalog_match": d["catalog_match"],
+                "value": aggregate_by_region[name]["value"],
+                "catalog_match": aggregate_by_region[name]["catalog_match"],
             }
-            for name, d in sorted(aggregate_by_region.items())
+            for name in order
         ]
         region_summary = compute_region_summary(region_history, aggregate_by_region)
-        region_history_ordered = dict(sorted(region_history.items()))
+        rh_order = sorted_region_names(region_history.keys())
+        region_history_ordered = {name: region_history[name] for name in rh_order}
+        rs_order = sorted_region_names(region_summary.keys())
+        region_summary_ordered = {name: region_summary[name] for name in rs_order}
         payload = {
             "schema": "pokerth_tablemap_v3_aggregate",
             "generated_at": datetime.now().isoformat(timespec="seconds"),
@@ -790,7 +942,7 @@ def main() -> int:
             "remaining_text_lines_latest": stats_latest.get("remaining_text_lines", 0),
             "scans": list(scans),
             "region_history": region_history_ordered,
-            "region_summary": dict(sorted(region_summary.items())),
+            "region_summary": region_summary_ordered,
         }
         out_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
         print("[V3] final export written:", out_path, flush=True)
@@ -844,19 +996,21 @@ def main() -> int:
         body = results_body_frame
 
         region_summary = compute_region_summary(region_history, aggregate_by_region)
+        rng = sorted_region_names(region_summary.keys())
         summary_lines: list[str] = []
-        for name in sorted(region_summary.keys()):
+        for name in rng:
             s = region_summary[name]
             summary_lines.append(
                 f"{name} → aktuell: {s['current_value']} | zuerst: Scan {s['first_seen_scan']} | "
                 f"zuletzt: Scan {s['last_seen_scan']} | Treffer: {s['hit_count']}"
             )
+        rag = sorted_region_names(aggregate_by_region.keys())
         aggregated_lines = [
             f"{'*' if aggregate_by_region[name]['catalog_match'] else '?'} {name}  →  {aggregate_by_region[name]['value']}"
-            for name in sorted(aggregate_by_region.keys())
+            for name in rag
         ]
         detail_blocks: list[str] = []
-        for name in sorted(region_history.keys()):
+        for name in sorted_region_names(region_history.keys()):
             lines = [f"{name}:"]
             for e in region_history[name]:
                 lines.append(
@@ -1040,7 +1194,7 @@ def main() -> int:
             agg_block = (
                 "\n".join(
                     f"{'*' if aggregate_by_region[n]['catalog_match'] else '?'} {n}  →  {aggregate_by_region[n]['value']}"
-                    for n in sorted(aggregate_by_region.keys())
+                    for n in sorted_region_names(aggregate_by_region.keys())
                 )
                 or "(noch keine Regionen)"
             )
@@ -1086,6 +1240,8 @@ def main() -> int:
             results_window.focus_force()
         except tk.TclError as exc:
             print("[V3][WARN] focus_force failed:", repr(exc), flush=True)
+        if aggregate_by_region:
+            print("[V3] region sort applied", flush=True)
         print("[V3] show_results returned / GUI built", flush=True)
 
     def _clear_wait_inner() -> None:
@@ -1113,18 +1269,11 @@ def main() -> int:
             regions, stats = group_tokens_into_regions(tokens)
             nt_ok, nr_ok = len(tokens), len(regions)
             print(f"[V3] candidate tokens:{nt_ok} regions:{nr_ok}", flush=True)
-            if not is_valid_pokerth_scan(current, regions):
-                print(
-                    f"[V3] invalid scan ignored: clipboard length={len(current)}, tokens={nt_ok}, regions={nr_ok}",
-                    flush=True,
-                )
+
+            def resume_after_rejected_scan(dialog_title: str, dialog_body: str) -> None:
+                nonlocal baseline, clipboard_text, polling_active
                 try:
-                    messagebox.showinfo(
-                        "Tablemap Scanner V3",
-                        "Kein verwertbarer PokerTH-Text erkannt.\n\n"
-                        "Bitte erneut mit dem Snipping Tool kopieren.",
-                        parent=root,
-                    )
+                    messagebox.showinfo(dialog_title, dialog_body, parent=root)
                 except tk.TclError:
                     pass
                 kill_snipping_process(proc)
@@ -1144,6 +1293,27 @@ def main() -> int:
                 print("[V3] waiting for next scan", flush=True)
                 build_state1()
                 root.after(POLL_INTERVAL_MS, on_poll)
+
+            if looks_like_own_results_text(current):
+                print("[V3] invalid scan ignored: own results text detected", flush=True)
+                resume_after_rejected_scan(
+                    "Tablemap Scanner V3",
+                    "Der kopierte Text stammt offenbar aus dem Tablemap-Scanner-Ergebnisfenster "
+                    "und wird nicht als PokerTH-Scan übernommen.\n\n"
+                    "Bitte erneut Text direkt aus dem Snipping Tool kopieren.",
+                )
+                return
+
+            if not is_valid_pokerth_scan(current, regions):
+                print(
+                    f"[V3] invalid scan ignored: clipboard length={len(current)}, tokens={nt_ok}, regions={nr_ok}",
+                    flush=True,
+                )
+                resume_after_rejected_scan(
+                    "Tablemap Scanner V3",
+                    "Kein verwertbarer PokerTH-Text erkannt.\n\n"
+                    "Bitte erneut mit dem Snipping Tool kopieren.",
+                )
                 return
 
             scan_no = len(scans) + 1

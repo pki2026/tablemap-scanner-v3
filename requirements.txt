@@ -2,5 +2,8 @@
 pywin32>=306
 # tkinter — Standardbibliothek unter Windows (kein pip-Paket)
 
-# Desktop-Anker-Kalibrierung (--calibrate-anchor): ImageGrab
+# Anker-Kalibrierung (--calibrate-anchor): PIL Image / ImageTk für Screenshot-Dialog
 Pillow>=10.0.0
+# Vermessung: OpenCV Template-Matching + Kanten-Heuristik für Textboxen
+opencv-python-headless>=4.8.0
+numpy>=1.24.0

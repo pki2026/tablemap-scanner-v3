@@ -4,6 +4,9 @@ __pycache__/
 venv/
 output/*.json
 
+# Markierte Snipping-Aufnahmen (Vermessung)
+captures/*.png
+
 # Nutzer-lokale Anker — nicht committen
 anchors/table_anchor_patch.png
 anchors/table_anchor_config.json

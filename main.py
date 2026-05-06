@@ -18,7 +18,8 @@ from pathlib import Path
 import tkinter as tk
 from tkinter import messagebox
 
-from anchor_kit import clear_saved_anchor_files, run_anchor_calibration_blocking
+from anchor_kit import ANCHOR_PATCH_PATH, clear_saved_anchor_files, run_anchor_calibration_blocking
+from measure_kit import MeasureError, capture_and_measure_snipping_tool
 
 import win32clipboard
 import win32con
@@ -1248,8 +1249,8 @@ def main() -> int:
     for w in root.winfo_children():
         w.destroy()
     root.title("Tablemap Scanner V3")
-    root.geometry("600x340")
-    root.minsize(520, 300)
+    root.geometry("600x420")
+    root.minsize(520, 360)
     root.attributes("-topmost", True)
 
     out_dir = Path(__file__).resolve().parent / "output"
@@ -1293,6 +1294,7 @@ def main() -> int:
     stats_latest: dict[str, int] = {"region_count": 0, "remaining_text_lines": 0}
     results_toplevel: tk.Toplevel | None = None
     results_body_frame: tk.Frame | None = None
+    pending_geometry: dict | None = None
 
     def _start_snipping() -> bool:
         nonlocal proc
@@ -1367,6 +1369,10 @@ def main() -> int:
             "region_history": region_history_ordered,
             "region_summary": region_summary_ordered,
         }
+        last_scan = scans[-1] if scans else {}
+        payload["marked_capture_latest"] = last_scan.get("marked_capture")
+        payload["anchor_latest"] = last_scan.get("anchor")
+        payload["snipping_text_boxes_latest"] = last_scan.get("snipping_text_boxes")
         out_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
         print("[V3] final export written:", out_path, flush=True)
 
@@ -1454,12 +1460,23 @@ def main() -> int:
             )
         last_raw = scans[-1]["clipboard_raw"] if scans else ""
 
+        _meas_note = ""
+        if scans:
+            _ls = scans[-1]
+            _boxes = _ls.get("snipping_text_boxes") or []
+            _cap = _ls.get("marked_capture") or {}
+            if _cap:
+                _meas_note = (
+                    f"\nLetzter Scan – Vermessung: {_cap.get('path', '')} | "
+                    f"Boxen: {len(_boxes)}"
+                )
+
         hdr_text = (
             f"Sammel-Scans: {n_scans}   "
             f"Aktuelle Regionen: {n_regions}   "
             f"Letzte Token-Anzahl: {len(tokens_latest)}   "
             f"Freie Textzeilen (__text__, letzter Scan): {stats_latest.get('remaining_text_lines', 0)}\n"
-            f"{export_note}"
+            f"{export_note}{_meas_note}"
         )
         tk.Label(body, text="Zusammenfassung / Status", font=("Segoe UI", 10, "bold")).pack(
             anchor="w", pady=(0, 2)
@@ -1674,6 +1691,7 @@ def main() -> int:
     def process_clipboard_and_show() -> None:
         nonlocal clipboard_text, _processing_results, baseline, proc, polling_active
         nonlocal scans, aggregate_by_region, region_history, tokens_latest, stats_latest
+        nonlocal pending_geometry
         if _processing_results or not clipboard_text:
             print(
                 "[V3] process_clipboard_and_show skipped:",
@@ -1682,6 +1700,18 @@ def main() -> int:
                 f"has_clipboard={bool(clipboard_text)}",
                 flush=True,
             )
+            return
+        if pending_geometry is None:
+            try:
+                messagebox.showwarning(
+                    "Tablemap Scanner V3",
+                    "Bitte zuerst „Markierung abgeschlossen – Boxen vermessen“ ausführen,\n"
+                    "wenn das Snipping-Fenster mit den markierten Textstellen sichtbar ist — "
+                    "danach „Daten verarbeiten“.",
+                    parent=root,
+                )
+            except tk.TclError:
+                pass
             return
         _processing_results = True
         current = clipboard_text
@@ -1694,7 +1724,7 @@ def main() -> int:
             print(f"[V3] candidate tokens:{nt_ok} regions:{nr_ok}", flush=True)
 
             def resume_after_rejected_scan(dialog_title: str, dialog_body: str) -> None:
-                nonlocal baseline, clipboard_text, polling_active
+                nonlocal baseline, clipboard_text, polling_active, pending_geometry
                 try:
                     messagebox.showinfo(dialog_title, dialog_body, parent=root)
                 except tk.TclError:
@@ -1712,6 +1742,7 @@ def main() -> int:
                         pass
                 baseline = _normalize_clip(current)
                 clipboard_text = None
+                pending_geometry = None
                 polling_active = True
                 print("[V3] waiting for next scan", flush=True)
                 build_state1()
@@ -1762,6 +1793,7 @@ def main() -> int:
             print(f"[V3] region summary entries: {len(region_history)}", flush=True)
             tokens_latest = tokens
             stats_latest = dict(stats)
+            geom = pending_geometry
             scans.append(
                 {
                     "scan_index": scan_no,
@@ -1769,8 +1801,12 @@ def main() -> int:
                     "clipboard_raw": current,
                     "token_count": len(tokens),
                     "region_count": stats["region_count"],
+                    "marked_capture": geom["marked_capture"],
+                    "anchor": geom["anchor"],
+                    "snipping_text_boxes": geom["snipping_text_boxes"],
                 }
             )
+            pending_geometry = None
             print("[V3] json written: (finale Datei erst bei „Speichern und Beenden“)", flush=True)
             kill_snipping_process(proc)
             if not _start_snipping():
@@ -1808,12 +1844,13 @@ def main() -> int:
             _processing_results = False
 
     def discard_pending_scan() -> None:
-        nonlocal baseline, clipboard_text, polling_active, proc
+        nonlocal baseline, clipboard_text, polling_active, proc, pending_geometry
         if session_done or not clipboard_text:
             return
         print("[V3] discard pending scan", flush=True)
         baseline = _normalize_clip(clipboard_text)
         clipboard_text = None
+        pending_geometry = None
         polling_active = True
         kill_snipping_process(proc)
         if not _start_snipping():
@@ -1827,6 +1864,42 @@ def main() -> int:
                 pass
         build_state1()
         root.after(POLL_INTERVAL_MS, on_poll)
+
+    def measure_marked_boxes() -> None:
+        nonlocal pending_geometry
+        if session_done or not clipboard_text:
+            return
+        repo = Path(__file__).resolve().parent
+        try:
+            pending_geometry = capture_and_measure_snipping_tool(repo, ANCHOR_PATCH_PATH)
+        except MeasureError as exc:
+            print(f"[V3] measure failed: {exc}", flush=True)
+            try:
+                messagebox.showerror("Vermessung", str(exc), parent=root)
+            except tk.TclError:
+                pass
+            return
+        nbox = len(pending_geometry["snipping_text_boxes"])
+        anchor = pending_geometry["anchor"]
+        cap_path = pending_geometry["marked_capture"]["path"]
+        print(f"[V3] measure: capture saved {cap_path}", flush=True)
+        print(
+            f"[V3] measure: anchor ({anchor['x']},{anchor['y']}) score={anchor['match_score']:.3f}",
+            flush=True,
+        )
+        print(f"[V3] measure: boxes detected: {nbox}", flush=True)
+        try:
+            messagebox.showinfo(
+                "Vermessung",
+                f"Aufnahme gespeichert.\nAnker: ({anchor['x']}, {anchor['y']}), "
+                f"Score {anchor['match_score']:.2f}\n"
+                f"Boxen erkannt: {nbox}\n\n"
+                "Als Nächstes „Daten verarbeiten“.",
+                parent=root,
+            )
+        except tk.TclError:
+            pass
+        build_state2()
 
     def build_state1() -> None:
         _clear_wait_inner()
@@ -1895,9 +1968,33 @@ def main() -> int:
             wraplength=520,
             justify=tk.CENTER,
         ).pack(anchor=tk.CENTER, pady=(0, 4))
+        if pending_geometry is not None:
+            _nb = len(pending_geometry["snipping_text_boxes"])
+            _ms = pending_geometry["anchor"]["match_score"]
+            _meas_line = (
+                f"Vermessung für diesen Scan: erledigt ({_nb} Boxen, Anker-Score {_ms:.2f}). "
+                "Weiter mit „Daten verarbeiten“."
+            )
+            _meas_color = "#206020"
+        else:
+            _meas_line = (
+                "Vermessung für diesen Scan: noch ausstehend — zuerst "
+                "„Markierung abgeschlossen – Boxen vermessen“."
+            )
+            _meas_color = "#805010"
         tk.Label(
             wait_inner,
-            text="Bitte bestätigen, um die Daten in den Ergebnisbestand zu übernehmen.",
+            text=_meas_line,
+            fg=_meas_color,
+            wraplength=520,
+            justify=tk.CENTER,
+        ).pack(anchor=tk.CENTER, pady=(0, 4))
+        tk.Label(
+            wait_inner,
+            text=(
+                "Ablauf: Snipping-Fenster mit Markierungen sichtbar → „Boxen vermessen“ → "
+                "„Daten verarbeiten“."
+            ),
             wraplength=520,
             justify=tk.CENTER,
         ).pack(anchor=tk.CENTER, pady=(0, 4))
@@ -1907,6 +2004,11 @@ def main() -> int:
             wraplength=520,
             justify=tk.CENTER,
         ).pack(anchor=tk.CENTER, pady=(0, 8))
+        tk.Button(
+            wait_inner,
+            text="Markierung abgeschlossen – Boxen vermessen",
+            command=measure_marked_boxes,
+        ).pack(anchor=tk.CENTER, pady=(0, 6))
         btn_row1 = tk.Frame(wait_inner)
         btn_row1.pack(anchor=tk.CENTER, pady=(4, 2))
         tk.Button(btn_row1, text="Daten verarbeiten", command=process_clipboard_and_show).pack(
@@ -1928,7 +2030,7 @@ def main() -> int:
     baseline = _normalize_clip(baseline_raw)
 
     def on_poll() -> None:
-        nonlocal clipboard_text, polling_active
+        nonlocal clipboard_text, polling_active, pending_geometry
         if session_done or not polling_active:
             return
 
@@ -1936,6 +2038,7 @@ def main() -> int:
         current = _normalize_clip(current_raw)
         if current and current != baseline:
             print("[V3] scan detected (new clipboard)", flush=True)
+            pending_geometry = None
             clipboard_text = current
             polling_active = False
             kill_snipping_process(proc)

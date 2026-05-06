@@ -544,48 +544,125 @@ def is_valid_pokerth_scan(clipboard_text: str, regions: list[dict]) -> bool:
 
 
 def readonly_copyable_text_finalize(w: tk.Text, app: tk.Misc) -> None:
-    """state=normal, Bearbeitung blockiert, Auswahl + Ctrl+C / Ctrl+A möglich."""
-    nav_keys = frozenset(
-        {
-            "Left",
-            "Right",
-            "Up",
-            "Down",
-            "Home",
-            "End",
-            "Next",
-            "Prior",
-            "Shift_L",
-            "Shift_R",
-            "Control_L",
-            "Control_R",
-            "Alt_L",
-            "Alt_R",
-        }
-    )
+    """Text ist schreibgeschützt; Mausauswahl, Ctrl+A/C, Rechtsklick-Menü, Kopieren per Hilfsfunktion."""
 
-    def on_key(ev: tk.Event) -> str | None:
-        ks = ev.keysym
-        if ev.state & 0x0004:
-            low = ks.lower()
-            if low == "c" or ks == "Insert":
-                try:
-                    if w.tag_ranges(tk.SEL):
-                        app.clipboard_clear()
-                        app.clipboard_append(w.get(tk.SEL_FIRST, tk.SEL_LAST))
-                except tk.TclError:
-                    pass
-                return "break"
-            if low == "a":
-                w.tag_remove(tk.SEL, "1.0", tk.END)
-                w.tag_add(tk.SEL, "1.0", tk.END + "-1c")
-                return "break"
-        if ks in nav_keys:
-            return None
+    def clipboard_copy_selection() -> None:
+        try:
+            if not w.tag_ranges(tk.SEL):
+                return
+            txt = w.get(tk.SEL_FIRST, tk.SEL_LAST)
+        except tk.TclError:
+            return
+        try:
+            app.clipboard_clear()
+            app.clipboard_append(txt)
+            app.update_idletasks()
+            app.update()
+        except tk.TclError:
+            pass
+
+    def on_select_all(_event: tk.Event | None = None) -> str:
+        w.focus_set()
+        try:
+            w.tag_remove(tk.SEL, "1.0", tk.END)
+            w.tag_add(tk.SEL, "1.0", tk.END + "-1c")
+        except tk.TclError:
+            pass
         return "break"
 
-    w.configure(state="normal")
-    w.bind("<Key>", on_key, add=True)
+    def on_copy_hotkey(_event: tk.Event | None = None) -> str:
+        clipboard_copy_selection()
+        return "break"
+
+    def block_editing_keys(ev: tk.Event) -> str | None:
+        st = ev.state or 0
+        ctrl = bool(st & 0x0004)
+
+        ks = ev.keysym
+
+        if ctrl:
+            if ks.lower() in {"v", "x"}:
+                return "break"
+            return None
+
+        navigation = frozenset(
+            {
+                "Left",
+                "Right",
+                "Up",
+                "Down",
+                "Home",
+                "End",
+                "Next",
+                "Prior",
+                "KP_Left",
+                "KP_Right",
+                "KP_Up",
+                "KP_Down",
+                "KP_Page_Up",
+                "KP_Page_Down",
+                "Shift_L",
+                "Shift_R",
+                "Control_L",
+                "Control_R",
+                "Alt_L",
+                "Alt_R",
+                "Caps_Lock",
+                "Num_Lock",
+            }
+        )
+        if ks in navigation:
+            return None
+
+        block_named = frozenset(
+            {
+                "Return",
+                "KP_Enter",
+                "BackSpace",
+                "Delete",
+                "Tab",
+                "ISO_Left_Tab",
+                "Insert",
+                "space",
+                "Escape",
+            }
+        )
+        if ks in block_named:
+            return "break"
+
+        if ev.char:
+            try:
+                if ord(ev.char) >= 32 or ev.char in ("\t", "\n"):
+                    return "break"
+            except (TypeError, ValueError):
+                return "break"
+
+        return None
+
+    w.configure(state="normal", undo=False, exportselection=True)
+
+    w.bind("<Control-a>", on_select_all)
+    w.bind("<Control-A>", on_select_all)
+    w.bind("<Control-c>", on_copy_hotkey)
+    w.bind("<Control-C>", on_copy_hotkey)
+    w.bind("<Control-Insert>", on_copy_hotkey)
+
+    popup = tk.Menu(w, tearoff=0)
+    popup.add_command(label="Alles auswählen", command=lambda: on_select_all(None))
+    popup.add_command(label="Kopieren", command=clipboard_copy_selection)
+
+    def show_context_menu(ev: tk.Event) -> None:
+        try:
+            popup.tk_popup(ev.x_root, ev.y_root)
+        finally:
+            try:
+                popup.grab_release()
+            except tk.TclError:
+                pass
+
+    w.bind("<Button-3>", show_context_menu)
+
+    w.bind("<Key>", block_editing_keys, add="+")
 
 
 def main() -> int:
@@ -993,6 +1070,7 @@ def main() -> int:
             root.clipboard_clear()
             root.clipboard_append(blob)
             root.update_idletasks()
+            root.update()
 
         btn_bar = tk.Frame(body)
         btn_bar.pack(fill=tk.X, pady=(10, 4))

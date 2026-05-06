@@ -549,8 +549,8 @@ def main() -> int:
 
     root = tk.Tk()
     root.title("Tablemap Scanner V3")
-    root.geometry("520x260")
-    root.minsize(480, 220)
+    root.geometry("600x340")
+    root.minsize(520, 300)
     root.attributes("-topmost", True)
 
     wait_frame = tk.Frame(root, padx=16, pady=16)
@@ -563,51 +563,146 @@ def main() -> int:
     polling_active = True
     _processing_results = False
 
-    def _shutdown() -> None:
-        nonlocal session_done, exit_code
+    scans: list[dict] = []
+    aggregate_by_region: dict[str, dict] = {}
+    tokens_latest: list[dict] = []
+    stats_latest: dict[str, int] = {"region_count": 0, "remaining_text_lines": 0}
+    results_toplevel: tk.Toplevel | None = None
+    results_body_frame: tk.Frame | None = None
+
+    def _start_snipping() -> bool:
+        nonlocal proc
+        try:
+            proc = subprocess.Popen(
+                ["snippingtool.exe", "/clip", "/file", str(screenshot_path)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            return True
+        except FileNotFoundError:
+            proc = None
+            print(
+                "snippingtool.exe nicht gefunden (PATH / Windows-Komponente).",
+                file=sys.stderr,
+            )
+            return False
+
+    def save_and_exit() -> None:
+        nonlocal session_done, exit_code, proc
+        n_scans = len(scans)
+        if n_scans == 0:
+            try:
+                messagebox.showinfo(
+                    "Tablemap Scanner V3",
+                    "Noch keine Daten verarbeitet.",
+                    parent=root,
+                )
+            except tk.TclError:
+                pass
+            if not session_done:
+                session_done = True
+                exit_code = 0
+            kill_snipping_process(proc)
+            try:
+                if results_toplevel is not None and results_toplevel.winfo_exists():
+                    results_toplevel.destroy()
+            except tk.TclError:
+                pass
+            root.destroy()
+            return
+
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        out_path = out_dir / f"pokerth_tablemap_aggregate_{stamp}.json"
+        regions_flat = {name: d["value"] for name, d in aggregate_by_region.items()}
+        regions_detail = [
+            {
+                "region_name": name,
+                "value": d["value"],
+                "catalog_match": d["catalog_match"],
+            }
+            for name, d in sorted(aggregate_by_region.items())
+        ]
+        payload = {
+            "schema": "pokerth_tablemap_v3_aggregate",
+            "generated_at": datetime.now().isoformat(timespec="seconds"),
+            "screenshot": str(screenshot_path),
+            "scan_count": n_scans,
+            "regions": regions_flat,
+            "regions_detail": regions_detail,
+            "tokens_latest": tokens_latest,
+            "region_catalog": list(REGION_CATALOG),
+            "region_count_aggregate": len(aggregate_by_region),
+            "remaining_text_lines_latest": stats_latest.get("remaining_text_lines", 0),
+            "scans": list(scans),
+        }
+        out_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        print("[V3] final export written:", out_path, flush=True)
+
         if not session_done:
             session_done = True
             exit_code = 0
         kill_snipping_process(proc)
+        try:
+            if results_toplevel is not None and results_toplevel.winfo_exists():
+                results_toplevel.destroy()
+        except tk.TclError:
+            pass
         root.destroy()
 
-    root.protocol("WM_DELETE_WINDOW", _shutdown)
+    root.protocol("WM_DELETE_WINDOW", save_and_exit)
 
-    def show_results(
-        tokens: list[dict],
-        regions: list[dict],
-        stats: dict[str, int],
-        out_path: Path,
-        clipboard_raw: str,
-    ) -> None:
+    def refresh_aggregate_results_window() -> None:
+        nonlocal results_toplevel, results_body_frame
         print("[V3] show_results: building GUI", flush=True)
-        results_window = tk.Toplevel(root)
-        results_window.title("Tablemap Scanner V3 - Ergebnisse")
-        results_window.geometry("800x780")
-        results_window.minsize(620, 620)
-        results_window.transient(root)
 
         def _close_results_only() -> None:
-            results_window.destroy()
+            try:
+                if results_toplevel is not None and results_toplevel.winfo_exists():
+                    results_toplevel.destroy()
+            except tk.TclError:
+                pass
 
-        results_window.protocol("WM_DELETE_WINDOW", _close_results_only)
+        n_scans = len(scans)
+        n_regions = len(aggregate_by_region)
+        export_note = "Noch nicht gespeichert — „Speichern und Beenden“ im Steuerfenster."
 
-        body = tk.Frame(results_window)
-        body.pack(fill=tk.BOTH, expand=True, padx=10, pady=8)
+        if results_toplevel is None or not results_toplevel.winfo_exists():
+            results_toplevel = tk.Toplevel(root)
+            results_window = results_toplevel
+            results_window.title("Tablemap Scanner V3 - Ergebnisse")
+            results_window.geometry("800x780")
+            results_window.minsize(620, 620)
+            results_window.transient(root)
+
+            results_window.protocol("WM_DELETE_WINDOW", _close_results_only)
+            results_body_frame = tk.Frame(results_window)
+            results_body_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=8)
+        else:
+            results_window = results_toplevel
+            assert results_body_frame is not None
+            for child in results_body_frame.winfo_children():
+                child.destroy()
+
+        assert results_body_frame is not None
+        body = results_body_frame
+
         hdr = tk.Label(
             body,
             text=(
-                f"Tokens: {len(tokens)}   "
-                f"Regionen: {stats['region_count']}   "
-                f"Freie Textzeilen (__text__): {stats['remaining_text_lines']}\n"
-                f"Export: {out_path}"
+                f"Sammel-Scans: {n_scans}   "
+                f"Aktuelle Regionen: {n_regions}   "
+                f"Letzte Token-Anzahl: {len(tokens_latest)}   "
+                f"Freie Textzeilen (__text__, letzter Scan): {stats_latest.get('remaining_text_lines', 0)}\n"
+                f"{export_note}"
             ),
             justify=tk.LEFT,
             anchor="w",
         )
         hdr.pack(fill=tk.X)
 
-        tk.Label(body, text="Regionen", font=("Segoe UI", 10, "bold")).pack(anchor="w", pady=(10, 2))
+        tk.Label(body, text="Aggregierte Regionen", font=("Segoe UI", 10, "bold")).pack(
+            anchor="w", pady=(10, 2)
+        )
         scroll_wrap = tk.Frame(body)
         scroll_wrap.pack(fill=tk.BOTH, expand=True, pady=(0, 4))
         sb = tk.Scrollbar(scroll_wrap)
@@ -615,16 +710,17 @@ def main() -> int:
         sb.config(command=lb.yview)
         sb.pack(side=tk.RIGHT, fill=tk.Y)
         lb.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        for r in regions:
-            mark = "*" if r["catalog_match"] else "?"
-            lb.insert(tk.END, f"{mark} {r['region_name']}  →  {r['value']}")
+        for name in sorted(aggregate_by_region.keys()):
+            d = aggregate_by_region[name]
+            mark = "*" if d["catalog_match"] else "?"
+            lb.insert(tk.END, f"{mark} {name}  →  {d['value']}")
 
         text_lines = [
             token_full_text(t)
-            for t in tokens
+            for t in tokens_latest
             if (t.get("label") or "").strip() == "__text__"
         ]
-        tk.Label(body, text=f"__text__-Tokens ({len(text_lines)})", font=("Segoe UI", 10, "bold")).pack(
+        tk.Label(body, text=f"__text__-Tokens letzter Scan ({len(text_lines)})", font=("Segoe UI", 10, "bold")).pack(
             anchor="w", pady=(10, 2)
         )
         tf = tk.Frame(body)
@@ -632,7 +728,7 @@ def main() -> int:
         tsb = tk.Scrollbar(tf)
         ttxt = tk.Text(
             tf,
-            height=6,
+            height=5,
             width=96,
             wrap=tk.WORD,
             font=("Segoe UI", 9),
@@ -646,7 +742,40 @@ def main() -> int:
         ttxt.insert("1.0", "\n".join(text_lines) if text_lines else "(keine __text__-Tokens)")
         ttxt.config(state=tk.DISABLED)
 
-        tk.Label(body, text="Rohdaten aus Snipping Tool", font=("Segoe UI", 10, "bold")).pack(
+        tk.Label(body, text="Scan-Historie (Kurz)", font=("Segoe UI", 10, "bold")).pack(
+            anchor="w", pady=(8, 2)
+        )
+        hist_lines: list[str] = []
+        for s in scans:
+            hist_lines.append(
+                f"--- Scan {s['scan_index']} @ {s['created_at']} — "
+                f"Tokens={s['token_count']}, Regionen={s['region_count']} — "
+                f"{len(s['clipboard_raw'])} Zeichen Rohdaten"
+            )
+        hf = tk.Frame(body)
+        hf.pack(fill=tk.BOTH, expand=True, pady=(0, 4))
+        hsb = tk.Scrollbar(hf)
+        htxt = tk.Text(
+            hf,
+            height=8,
+            width=96,
+            wrap=tk.WORD,
+            font=("Consolas", 9),
+            yscrollcommand=hsb.set,
+            state=tk.DISABLED,
+        )
+        hsb.config(command=htxt.yview)
+        hsb.pack(side=tk.RIGHT, fill=tk.Y)
+        htxt.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        htxt.config(state=tk.NORMAL)
+        htxt.insert(
+            "1.0",
+            "\n".join(hist_lines) if hist_lines else "(noch keine Scans)",
+        )
+        htxt.config(state=tk.DISABLED)
+
+        last_raw = scans[-1]["clipboard_raw"] if scans else ""
+        tk.Label(body, text="Rohdaten letzter Scan", font=("Segoe UI", 10, "bold")).pack(
             anchor="w", pady=(8, 2)
         )
         rf = tk.Frame(body)
@@ -654,7 +783,7 @@ def main() -> int:
         rsb = tk.Scrollbar(rf)
         rtx = tk.Text(
             rf,
-            height=14,
+            height=8,
             width=96,
             wrap=tk.WORD,
             font=("Consolas", 9),
@@ -665,7 +794,7 @@ def main() -> int:
         rsb.pack(side=tk.RIGHT, fill=tk.Y)
         rtx.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         rtx.config(state=tk.NORMAL)
-        rtx.insert("1.0", clipboard_raw if clipboard_raw.strip() else "(leer)")
+        rtx.insert("1.0", last_raw if last_raw.strip() else "(leer)")
         rtx.config(state=tk.DISABLED)
 
         tk.Button(body, text="Fenster schließen", command=_close_results_only).pack(pady=(10, 4))
@@ -684,7 +813,8 @@ def main() -> int:
             child.destroy()
 
     def process_clipboard_and_show() -> None:
-        nonlocal clipboard_text, _processing_results
+        nonlocal clipboard_text, _processing_results, baseline, proc, polling_active
+        nonlocal scans, aggregate_by_region, tokens_latest, stats_latest
         if _processing_results or not clipboard_text:
             print(
                 "[V3] process_clipboard_and_show skipped:",
@@ -697,33 +827,53 @@ def main() -> int:
         _processing_results = True
         current = clipboard_text
         try:
+            scan_no = len(scans) + 1
+            print("[V3] scan detected", flush=True)
+            print(f"[V3] processing scan #{scan_no}", flush=True)
             print("[V3] process_clipboard_and_show started", flush=True)
-            print("[V3] clipboard length:", len(clipboard_text or ""), flush=True)
+            print("[V3] clipboard length:", len(current), flush=True)
             tokens = parse_clipboard_to_tokens(current)
             regions, stats = group_tokens_into_regions(tokens)
-            print("[V3] tokens:", len(tokens), flush=True)
-            print("[V3] regions:", len(regions), flush=True)
-            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            out_path = out_dir / f"pokerth_tablemap_{stamp}.json"
-            payload = {
-                "generated_at": datetime.now().isoformat(timespec="seconds"),
-                "screenshot": str(screenshot_path),
-                "token_count": len(tokens),
-                "tokens": tokens,
-                "regions": regions,
-                "region_catalog": list(REGION_CATALOG),
-                "region_count": stats["region_count"],
-                "remaining_text_lines": stats["remaining_text_lines"],
-                "clipboard_raw": current,
-            }
-            out_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-            print("[V3] json written:", out_path, flush=True)
-
+            print(f"[V3] scan #{scan_no} tokens:", len(tokens), flush=True)
+            print(f"[V3] scan #{scan_no} regions:", len(regions), flush=True)
+            for r in regions:
+                aggregate_by_region[r["region_name"]] = {
+                    "value": r["value"],
+                    "catalog_match": r["catalog_match"],
+                }
+            print("[V3] aggregate regions:", len(aggregate_by_region), flush=True)
+            tokens_latest = tokens
+            stats_latest = dict(stats)
+            scans.append(
+                {
+                    "scan_index": scan_no,
+                    "created_at": datetime.now().isoformat(timespec="seconds"),
+                    "clipboard_raw": current,
+                    "token_count": len(tokens),
+                    "region_count": stats["region_count"],
+                }
+            )
+            print("[V3] json written: (finale Datei erst bei „Speichern und Beenden“)", flush=True)
             kill_snipping_process(proc)
+            if not _start_snipping():
+                try:
+                    messagebox.showwarning(
+                        "Tablemap Scanner V3",
+                        "snippingtool.exe konnte nicht neu gestartet werden. "
+                        "Erneuter Clipboard-Empfang ist ggf. eingeschränkt.",
+                        parent=root,
+                    )
+                except tk.TclError:
+                    pass
             print("[V3] calling show_results", flush=True)
-            show_results(tokens, regions, stats, out_path, current)
+            refresh_aggregate_results_window()
             print("[V3] show_results finished (after build)", flush=True)
-            build_state3_processed()
+            baseline = _normalize_clip(current)
+            clipboard_text = None
+            polling_active = True
+            print("[V3] waiting for next scan", flush=True)
+            build_state1()
+            root.after(POLL_INTERVAL_MS, on_poll)
         except Exception as exc:
             print("[V3][ERROR]", repr(exc), flush=True)
             traceback.print_exc()
@@ -739,74 +889,103 @@ def main() -> int:
         finally:
             _processing_results = False
 
+    def discard_pending_scan() -> None:
+        nonlocal baseline, clipboard_text, polling_active, proc
+        if session_done or not clipboard_text:
+            return
+        print("[V3] discard pending scan", flush=True)
+        baseline = _normalize_clip(clipboard_text)
+        clipboard_text = None
+        polling_active = True
+        kill_snipping_process(proc)
+        if not _start_snipping():
+            try:
+                messagebox.showwarning(
+                    "Tablemap Scanner V3",
+                    "snippingtool.exe konnte nicht neu gestartet werden.",
+                    parent=root,
+                )
+            except tk.TclError:
+                pass
+        build_state1()
+        root.after(POLL_INTERVAL_MS, on_poll)
+
     def build_state1() -> None:
         _clear_wait_inner()
+        n_done = len(scans)
         tk.Label(wait_inner, text="Tablemap Scanner V3", font=("Segoe UI", 11, "bold")).pack(
             anchor=tk.CENTER, pady=(0, 6)
         )
-        tk.Label(
-            wait_inner,
-            text="Warte auf Text aus dem Snipping Tool ...",
-            wraplength=460,
-            justify=tk.CENTER,
-        ).pack(anchor=tk.CENTER, pady=(0, 4))
+        if n_done == 0:
+            tk.Label(
+                wait_inner,
+                text="Warte auf Text aus dem Snipping Tool ...",
+                wraplength=520,
+                justify=tk.CENTER,
+            ).pack(anchor=tk.CENTER, pady=(0, 4))
+        else:
+            tk.Label(
+                wait_inner,
+                text="Warte auf weiteren Text aus dem Snipping Tool ...",
+                wraplength=520,
+                justify=tk.CENTER,
+            ).pack(anchor=tk.CENTER, pady=(0, 4))
         tk.Label(
             wait_inner,
             text=(
                 "Bitte im Snipping Tool den Bereich markieren und "
                 "„Text aus Bild kopieren“ klicken."
             ),
-            wraplength=460,
+            wraplength=520,
+            justify=tk.CENTER,
+        ).pack(anchor=tk.CENTER, pady=(0, 4))
+        tk.Label(
+            wait_inner,
+            text=f"Bisherige Scans: {n_done}",
+            wraplength=520,
             justify=tk.CENTER,
         ).pack(anchor=tk.CENTER, pady=(0, 14))
         tk.Button(
             wait_inner,
-            text="Scan abbrechen / Beenden",
-            command=_shutdown,
+            text="Speichern und Beenden",
+            command=save_and_exit,
         ).pack(anchor=tk.CENTER)
 
     def build_state2() -> None:
         _clear_wait_inner()
+        n_done = len(scans)
         tk.Label(wait_inner, text="Tablemap Scanner V3", font=("Segoe UI", 11, "bold")).pack(
             anchor=tk.CENTER, pady=(0, 6)
         )
         tk.Label(
             wait_inner,
             text="Text aus dem Snipping Tool wurde erkannt.",
-            wraplength=460,
+            wraplength=520,
             justify=tk.CENTER,
         ).pack(anchor=tk.CENTER, pady=(0, 4))
         tk.Label(
             wait_inner,
-            text="Bitte bestätigen, um die Daten zu verarbeiten.",
-            wraplength=460,
-            justify=tk.CENTER,
-        ).pack(anchor=tk.CENTER, pady=(0, 14))
-        btn_row = tk.Frame(wait_inner)
-        btn_row.pack(anchor=tk.CENTER, pady=(4, 0))
-        tk.Button(btn_row, text="Daten verarbeiten", command=process_clipboard_and_show).pack(
-            side=tk.LEFT, padx=8
-        )
-        tk.Button(btn_row, text="Abbrechen / Beenden", command=_shutdown).pack(side=tk.LEFT, padx=8)
-
-    def build_state3_processed() -> None:
-        _clear_wait_inner()
-        tk.Label(wait_inner, text="Tablemap Scanner V3", font=("Segoe UI", 11, "bold")).pack(
-            anchor=tk.CENTER, pady=(0, 6)
-        )
-        tk.Label(
-            wait_inner,
-            text="Daten wurden verarbeitet.",
-            wraplength=460,
+            text="Bitte bestätigen, um die Daten in den Ergebnisbestand zu übernehmen.",
+            wraplength=520,
             justify=tk.CENTER,
         ).pack(anchor=tk.CENTER, pady=(0, 4))
         tk.Label(
             wait_inner,
-            text="Das Ergebnisfenster ist geöffnet.",
-            wraplength=460,
+            text=f"Bisherige Scans: {n_done}",
+            wraplength=520,
             justify=tk.CENTER,
-        ).pack(anchor=tk.CENTER, pady=(0, 14))
-        tk.Button(wait_inner, text="Beenden", command=_shutdown).pack(anchor=tk.CENTER)
+        ).pack(anchor=tk.CENTER, pady=(0, 8))
+        btn_row1 = tk.Frame(wait_inner)
+        btn_row1.pack(anchor=tk.CENTER, pady=(4, 2))
+        tk.Button(btn_row1, text="Daten verarbeiten", command=process_clipboard_and_show).pack(
+            side=tk.LEFT, padx=6
+        )
+        tk.Button(btn_row1, text="Verwerfen und weiter warten", command=discard_pending_scan).pack(
+            side=tk.LEFT, padx=6
+        )
+        tk.Button(wait_inner, text="Speichern und Beenden", command=save_and_exit).pack(
+            anchor=tk.CENTER, pady=(6, 0)
+        )
 
     build_state1()
 
@@ -824,6 +1003,7 @@ def main() -> int:
         current_raw = _read_clipboard_text()
         current = _normalize_clip(current_raw)
         if current and current != baseline:
+            print("[V3] scan detected (new clipboard)", flush=True)
             clipboard_text = current
             polling_active = False
             kill_snipping_process(proc)

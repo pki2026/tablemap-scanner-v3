@@ -559,6 +559,7 @@ def main() -> int:
 
     clipboard_text: str | None = None
     polling_active = True
+    _processing_results = False
 
     def _shutdown() -> None:
         nonlocal session_done, exit_code
@@ -656,37 +657,45 @@ def main() -> int:
         rtx.insert("1.0", clipboard_raw if clipboard_raw.strip() else "(leer)")
         rtx.config(state=tk.DISABLED)
 
-        tk.Button(body, text="Schließen", command=_shutdown).pack(pady=(10, 4))
+        tk.Button(body, text="Beenden", command=_shutdown).pack(pady=(10, 4))
+        root.update_idletasks()
+        root.update()
+        root.lift()
+        root.focus_force()
 
     def _clear_wait_inner() -> None:
         for child in wait_inner.winfo_children():
             child.destroy()
 
     def process_clipboard_and_show() -> None:
-        nonlocal session_done, clipboard_text
-        if session_done or not clipboard_text:
+        nonlocal session_done, clipboard_text, _processing_results
+        if _processing_results or session_done or not clipboard_text:
             return
+        _processing_results = True
         current = clipboard_text
-        tokens = parse_clipboard_to_tokens(current)
-        regions, stats = group_tokens_into_regions(tokens)
-        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        out_path = out_dir / f"pokerth_tablemap_{stamp}.json"
-        payload = {
-            "generated_at": datetime.now().isoformat(timespec="seconds"),
-            "screenshot": str(screenshot_path),
-            "token_count": len(tokens),
-            "tokens": tokens,
-            "regions": regions,
-            "region_catalog": list(REGION_CATALOG),
-            "region_count": stats["region_count"],
-            "remaining_text_lines": stats["remaining_text_lines"],
-            "clipboard_raw": current,
-        }
-        out_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        try:
+            tokens = parse_clipboard_to_tokens(current)
+            regions, stats = group_tokens_into_regions(tokens)
+            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            out_path = out_dir / f"pokerth_tablemap_{stamp}.json"
+            payload = {
+                "generated_at": datetime.now().isoformat(timespec="seconds"),
+                "screenshot": str(screenshot_path),
+                "token_count": len(tokens),
+                "tokens": tokens,
+                "regions": regions,
+                "region_catalog": list(REGION_CATALOG),
+                "region_count": stats["region_count"],
+                "remaining_text_lines": stats["remaining_text_lines"],
+                "clipboard_raw": current,
+            }
+            out_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
-        session_done = True
-        kill_snipping_process(proc)
-        show_results(tokens, regions, stats, out_path, current)
+            kill_snipping_process(proc)
+            show_results(tokens, regions, stats, out_path, current)
+            session_done = True
+        finally:
+            _processing_results = False
 
     def build_state1() -> None:
         _clear_wait_inner()

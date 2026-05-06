@@ -5,10 +5,11 @@ Snipping-Tool-Fenster erfassen (BBox), Anker per Template-Matching, heuristische
 from __future__ import annotations
 
 from dataclasses import dataclass
+from collections import defaultdict, deque
 from datetime import datetime
 from pathlib import Path
+import math
 import re
-from collections import defaultdict
 
 import cv2
 import numpy as np
@@ -257,6 +258,63 @@ def filter_boxes_for_mapping(
     return usable, ignored
 
 
+# --- Layout-Zonen (normierte Snipping-Bildkoordinaten, Box-Mittelpunkt) ---
+_POT_REGION_NAMES = frozenset(
+    {
+        "c0pot_total",
+        "c0pot_bets",
+        "c0pot0",
+        "c0smallblind",
+        "c0bigblind",
+    }
+)
+
+
+def expected_layout_zone(region_name: str) -> str | None:
+    """Erwartete UI-Zone für eine Region (Player-Sitz, Pot, Game/Hand, Buttons)."""
+    m = re.match(r"^p([0-9])(name|balance|dealer|bet)$", region_name)
+    if m:
+        return f"player_{m.group(1)}"
+    if region_name in _POT_REGION_NAMES:
+        return "pot"
+    if region_name in ("game_id", "hand_id", "street"):
+        return "game_hand"
+    if re.match(r"^i\d+label$", region_name):
+        return "button"
+    return None
+
+
+def _box_norm_center(abs_box: dict, img_w: int, img_h: int) -> tuple[float, float]:
+    x1, y1, x2, y2 = (
+        float(abs_box["x1"]),
+        float(abs_box["y1"]),
+        float(abs_box["x2"]),
+        float(abs_box["y2"]),
+    )
+    iw, ih = max(1, int(img_w)), max(1, int(img_h))
+    return ((x1 + x2) * 0.5 / iw, (y1 + y2) * 0.5 / ih)
+
+
+def classify_box_layout_zone(abs_box: dict, img_w: int, img_h: int) -> str:
+    """
+    Heuristik: Game/Hand oben, Buttons unten, Pot in der Mitte, sonst Spieler am Umlauf.
+    """
+    cx, cy = _box_norm_center(abs_box, img_w, img_h)
+    if cy < 0.32 and cx < 0.62:
+        return "game_hand"
+    if cy > 0.70 and 0.18 < cx < 0.82:
+        return "button"
+    if math.hypot(cx - 0.5, cy - 0.5) < 0.20:
+        return "pot"
+    dx, dy = cx - 0.5, cy - 0.5
+    if abs(dx) + abs(dy) < 0.045:
+        return "pot"
+    ang = math.atan2(dy, dx)
+    t = (math.pi / 2 - ang) / (2 * math.pi / 10)
+    seat = int(round(t)) % 10
+    return f"player_{seat}"
+
+
 class _UnionFind:
     def __init__(self, n: int) -> None:
         self._p = list(range(n))
@@ -314,31 +372,48 @@ def _merge_token_clusters_from_regions(regions: list[dict], n_tokens: int) -> _U
     return uf
 
 
-def _sorted_token_clusters(uf: _UnionFind, n_tokens: int) -> list[list[int]]:
-    buckets: defaultdict[int, list[int]] = defaultdict(list)
-    for i in range(n_tokens):
-        buckets[uf.find(i)].append(i)
-    clusters = [sorted(v) for v in buckets.values()]
-    clusters.sort(key=lambda c: (c[0], len(c)))
-    return clusters
+def _root_to_target_zones(uf: _UnionFind, regions: list[dict], n_tokens: int) -> tuple[dict[int, str | None], set[int]]:
+    roots: dict[int, str | None] = {}
+    conflict_root: set[int] = set()
+    for r in regions:
+        z = expected_layout_zone(r["region_name"])
+        if z is None:
+            continue
+        for tx in r.get("source_token_indices") or []:
+            ti = int(tx)
+            if not (0 <= ti < n_tokens):
+                continue
+            root = int(uf.find(ti))
+            if root in conflict_root:
+                continue
+            prev = roots.get(root)
+            if prev is None:
+                roots[root] = z
+            elif prev != z:
+                conflict_root.add(root)
+                roots[root] = None
+    return roots, conflict_root
 
 
 def map_tokens_to_boxes_many_to_one(
     tokens: list[dict],
     regions: list[dict],
     usable_boxes: list[dict],
+    *,
+    capture_width: int,
+    capture_height: int,
 ) -> dict:
     """
-    Many-to-one: beliebig viele Tokens pro Snipping-Box (z. B. p*name + p*balance).
-    Tokenzahl != Boxzahl führt nicht zu niedriger Confidence.
+    Zonenbasiert: Cluster (z. B. p4name+p4balance) → Box in passender Player-4-Zone usw.;
+    Pot/Game-Hand/Button ebenso. Innerhalb einer Zone: oben→unten, links→rechts.
     """
     n_t = len(tokens)
-    n_b = len(usable_boxes)
     token_box_map: dict[str, int] = {}
     unmatched_tokens: list[int] = []
     unmatched_boxes: list[int] = []
+    box_layout_zones: dict[str, str] = {}
 
-    if n_t == 0 or n_b == 0:
+    if n_t == 0 or not usable_boxes:
         if n_t:
             unmatched_tokens = [int(t.get("token_index", i)) for i, t in enumerate(tokens)]
         unmatched_boxes = [int(b["box_index"]) for b in usable_boxes]
@@ -348,39 +423,73 @@ def map_tokens_to_boxes_many_to_one(
             "unmatched_tokens": unmatched_tokens,
             "unmatched_boxes": unmatched_boxes,
             "forced_cluster_merges": 0,
+            "box_layout_zones": box_layout_zones,
         }
 
+    iw, ih = int(capture_width), int(capture_height)
     uf = _merge_token_clusters_from_regions(regions, n_t)
-    clusters = _sorted_token_clusters(uf, n_t)
-    forced = 0
-    while len(clusters) > n_b:
-        clusters[-2].extend(clusters[-1])
-        clusters[-2].sort()
-        clusters.pop()
-        forced += 1
+    root_zone_ok, conflict_root = _root_to_target_zones(uf, regions, n_t)
 
-    for ci, clust in enumerate(clusters):
-        if ci >= n_b:
-            unmatched_tokens.extend(clust)
+    boxes_by_idx = {int(b["box_index"]): b for b in usable_boxes}
+
+    zone_queues: dict[str, deque[int]] = defaultdict(deque)
+    for b in usable_boxes:
+        bi = int(b["box_index"])
+        zn = classify_box_layout_zone(b["abs"], iw, ih)
+        box_layout_zones[str(bi)] = zn
+        zone_queues[zn].append(bi)
+
+    for zn, q in list(zone_queues.items()):
+        sorted_bis = sorted(
+            q,
+            key=lambda bi: (
+                boxes_by_idx[bi]["abs"]["y1"],
+                boxes_by_idx[bi]["abs"]["x1"],
+            ),
+        )
+        zone_queues[zn] = deque(sorted_bis)
+
+    root_to_tokens: defaultdict[int, list[int]] = defaultdict(list)
+    for i in range(n_t):
+        root_to_tokens[uf.find(i)].append(i)
+    for t_list in root_to_tokens.values():
+        t_list.sort()
+
+    zone_miss = False
+    for root in sorted(root_to_tokens.keys(), key=lambda rr: min(root_to_tokens[rr])):
+        toks = root_to_tokens[root]
+        if root in conflict_root or root_zone_ok.get(root) is None:
             continue
-        bi = int(usable_boxes[ci]["box_index"])
-        for tidx in clust:
+        z_need = root_zone_ok[root]
+        q = zone_queues.get(z_need)
+        if not q:
+            zone_miss = True
+            unmatched_tokens.extend(toks)
+            continue
+        bi = q.popleft()
+        for tidx in toks:
             token_box_map[str(int(tidx))] = bi
 
-    for j in range(len(clusters), n_b):
-        unmatched_boxes.append(int(usable_boxes[j]["box_index"]))
+    assigned_box_indices = set(token_box_map.values())
+    for b in usable_boxes:
+        bi = int(b["box_index"])
+        if bi not in assigned_box_indices:
+            unmatched_boxes.append(bi)
 
-    if forced > 0:
-        conf = "medium"
-    else:
-        conf = "high"
+    for i in range(n_t):
+        if str(i) not in token_box_map:
+            unmatched_tokens.append(i)
+
+    unmatched_tokens = sorted(set(unmatched_tokens))
+    conf = "medium" if (zone_miss or conflict_root) else "high"
 
     return {
         "token_box_map": token_box_map,
         "mapping_confidence": conf,
-        "unmatched_tokens": sorted(set(unmatched_tokens)),
-        "unmatched_boxes": unmatched_boxes,
-        "forced_cluster_merges": forced,
+        "unmatched_tokens": unmatched_tokens,
+        "unmatched_boxes": sorted(set(unmatched_boxes)),
+        "forced_cluster_merges": 0,
+        "box_layout_zones": box_layout_zones,
     }
 
 
@@ -402,10 +511,12 @@ def build_region_boxes(
             "region_name": rn,
             "value": val,
             "source_token_indices": sti,
+            "layout_zone": expected_layout_zone(rn),
             "box_index": None,
             "abs": None,
             "rel": None,
             "geometry_status": "unmatched",
+            "box_layout_zone": None,
         }
         if not allow_match or not sti:
             out.append(entry)
@@ -425,9 +536,15 @@ def build_region_boxes(
         if not boxd:
             out.append(entry)
             continue
+        blz = (mapping.get("box_layout_zones") or {}).get(str(bi))
+        exp_z = entry.get("layout_zone")
+        if exp_z is not None and blz is not None and blz != exp_z:
+            out.append(entry)
+            continue
         entry["box_index"] = bi
         entry["abs"] = dict(boxd["abs"])
         entry["rel"] = dict(boxd["rel"])
+        entry["box_layout_zone"] = blz
         entry["geometry_status"] = "matched"
         out.append(entry)
     return out

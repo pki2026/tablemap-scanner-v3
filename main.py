@@ -1916,7 +1916,13 @@ def main() -> int:
             usable_boxes, ignored_boxes = filter_boxes_for_mapping(
                 geom["snipping_text_boxes"], img_w, img_h
             )
-            map_bundle = map_tokens_to_boxes_many_to_one(tokens, regions, usable_boxes)
+            map_bundle = map_tokens_to_boxes_many_to_one(
+                tokens,
+                regions,
+                usable_boxes,
+                capture_width=img_w,
+                capture_height=img_h,
+            )
             boxes_by_index = {int(b["box_index"]): b for b in geom["snipping_text_boxes"]}
             region_boxes = build_region_boxes(regions, map_bundle, boxes_by_index)
             repo_root = Path(__file__).resolve().parent
@@ -1958,6 +1964,7 @@ def main() -> int:
                     "token_box_map": map_bundle["token_box_map"],
                     "mapping_confidence": map_bundle["mapping_confidence"],
                     "forced_cluster_merges": map_bundle.get("forced_cluster_merges", 0),
+                    "box_layout_zones": map_bundle.get("box_layout_zones", {}),
                     "unmatched_tokens": map_bundle["unmatched_tokens"],
                     "unmatched_boxes": map_bundle["unmatched_boxes"],
                     "region_boxes": region_boxes,

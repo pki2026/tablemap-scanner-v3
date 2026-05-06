@@ -1,17 +1,17 @@
 """
-Anker: vier dünne topmost Randfenster + 0,0 + Skaliergriff — Desktop bleibt außerhalb bedienbar.
+Anker-Kalibrierung: roter Rahmen auf dem Referenz-Screenshot (Tk + PIL).
+Kein Desktop-Overlay, kein Template-Matching in diesem Modul.
 """
 
 from __future__ import annotations
 
 import json
-import sys
-import time
 import traceback
 from datetime import datetime
 from pathlib import Path
 
-from PIL import ImageGrab
+from PIL import Image, ImageTk
+
 import tkinter as tk
 from tkinter import messagebox
 
@@ -19,11 +19,13 @@ REPO_ROOT = Path(__file__).resolve().parent
 ANCHORS_DIR = REPO_ROOT / "anchors"
 ANCHOR_PATCH_PATH = ANCHORS_DIR / "table_anchor_patch.png"
 ANCHOR_CONFIG_PATH = ANCHORS_DIR / "table_anchor_config.json"
+
 ANCHOR_SCHEMA = "tablemap_scanner_v3_anchor"
 
-THICK = 4
-HANDLE_SZ = 20
-ORIGIN_SZ = 40
+
+def saved_anchor_files_present() -> bool:
+    """True, wenn Kalibrierung abgeschlossen (Patch + Config auf der Platte)."""
+    return ANCHOR_PATCH_PATH.is_file() and ANCHOR_CONFIG_PATH.is_file()
 
 
 def _safe_grab_release(w: tk.Misc) -> None:
@@ -33,298 +35,355 @@ def _safe_grab_release(w: tk.Misc) -> None:
         pass
 
 
-def _destroy_windows(ws: list[tk.Misc]) -> None:
-    for w in ws:
+def run_anchor_calibration_blocking(root: tk.Tk, screenshot_path: Path, *, modal: bool = True) -> bool:
+    """
+    Tk-Calibrator: Bild aus ``screenshot_path``, Rechteck verschieben/skalieren, Patch speichern.
+    Blockiert über ``dlg.wait_window()`` bis Speichern, Abbruch oder Schließen.
+    """
+    print("[V3] anchor calibration started", flush=True)
+    img_path = screenshot_path.resolve()
+    print(f"[V3] anchor calibration: screenshot path={img_path}", flush=True)
+
+    if not img_path.is_file():
+        msg = f"Screenshot fehlt:\n{img_path}"
+        print(f"[V3][ERROR] anchor calibration failed: {msg}", flush=True)
         try:
-            _safe_grab_release(w)
-        except Exception:
-            pass
-        try:
-            w.destroy()
+            messagebox.showerror("Kalibrierung", msg, parent=root)
         except tk.TclError:
             pass
+        return False
 
+    print("[V3] anchor calibration: loading screenshot", flush=True)
+    try:
+        pil_img = Image.open(img_path).convert("RGB")
+    except OSError as e:
+        traceback.print_exc()
+        print(f"[V3][ERROR] anchor calibration failed: {e}", flush=True)
+        try:
+            messagebox.showerror("Kalibrierung", f"Bild konnte nicht geöffnet werden:\n{e}", parent=root)
+        except tk.TclError:
+            pass
+        return False
 
-def run_anchor_calibration_blocking(root: tk.Tk, *, modal: bool = True) -> bool:
-    print("[V3] anchor calibration: border frame (non-blocking)", flush=True)
+    iw, ih = pil_img.size
+    print(f"[V3] anchor calibration: screenshot loaded size={iw}x{ih}", flush=True)
+
+    sw = max(800, root.winfo_screenwidth())
+    sh = max(600, root.winfo_screenheight())
+    room_w = max(320, int(sw * 0.90) - 80)
+    room_h = max(240, int(sh * 0.85) - 170)
+    scale = min(1.0, room_w / max(iw, 1), room_h / max(ih, 1))
+    dw, dh = int(iw * scale), int(ih * scale)
 
     result: dict[str, bool] = {"saved": False, "closing": False}
 
-    try:
-        sw_i = int(root.winfo_screenwidth())
-        sh_i = int(root.winfo_screenheight())
-        print(f"[V3] anchor frame: screen {sw_i}x{sh_i}", flush=True)
+    print("[V3] anchor calibration: creating Tk window", flush=True)
 
-        fw0 = min(480, sw_i - 120)
-        fh0 = min(360, sh_i - 160)
-        frame = {
-            "left": max(40, (sw_i - fw0) // 2),
-            "top": max(40, (sh_i - fh0) // 2),
-            "w": fw0,
-            "h": fh0,
-        }
+    dlg = tk.Toplevel(root)
+    dlg.title("Tablemap Scanner V3 — Anker setzen")
+    dlg.transient(root)
 
-        interaction: dict[str, int | str | float] = {"mode": "idle"}
+    bx = tk.Frame(dlg)
+    bx.pack(fill=tk.X, padx=10, pady=8)
+    tk.Label(
+        bx,
+        text=(
+            "Rotes Rechteck verschieben (innen ziehen) und skalieren (Ecke rechts unten ziehen).\n"
+            "„Anker speichern“ schreibt den Ausschnitt aus der Original-PNG — ohne Overlay."
+        ),
+        justify=tk.LEFT,
+    ).pack(anchor="w")
+    tk.Label(
+        bx,
+        text="Nullpunkt: oben links (grünes Kreuz + 0,0)   |   Skalieren: blauer Griff rechts unten",
+        justify=tk.LEFT,
+        fg="#206020",
+    ).pack(anchor="w", pady=(4, 0))
 
-        def make_red_strip() -> tk.Toplevel:
-            w = tk.Toplevel(root)
-            w.overrideredirect(True)
-            w.attributes("-topmost", True)
-            fr = tk.Frame(w, bg="#ff2020", bd=0, highlightthickness=0)
-            fr.pack(fill=tk.BOTH, expand=True)
-            return w
+    cw = tk.Frame(dlg)
+    cw.pack(fill=tk.BOTH, expand=True, padx=8, pady=6)
+    vsb = tk.Scrollbar(cw, orient="vertical")
+    hsb = tk.Scrollbar(cw, orient="horizontal")
+    canvas_side = max(260, min(dw + 48, room_w))
+    canvas_below = max(220, min(dh + 48, room_h))
+    canvas = tk.Canvas(cw, width=canvas_side, height=canvas_below)
+    canvas.configure(xscrollcommand=hsb.set, yscrollcommand=vsb.set, highlightthickness=0)
+    hsb.config(command=canvas.xview)
+    vsb.config(command=canvas.yview)
+    hsb.pack(side=tk.BOTTOM, fill=tk.X)
+    vsb.pack(side=tk.RIGHT, fill=tk.Y)
+    canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
-        win_top = make_red_strip()
-        win_bottom = make_red_strip()
-        win_left = make_red_strip()
-        win_right = make_red_strip()
+    _rs = Image.Resampling.LANCZOS if hasattr(Image, "Resampling") else Image.LANCZOS
+    resized = pil_img.resize((dw, dh), _rs)
+    photo = ImageTk.PhotoImage(resized, master=dlg)
+    canvas.create_image(0, 0, anchor=tk.NW, image=photo)
+    dlg.photo_ref = photo  # noqa: SLF001
+    canvas.config(scrollregion=(0, 0, dw, dh))
 
-        win_origin = tk.Toplevel(root)
-        win_origin.overrideredirect(True)
-        win_origin.attributes("-topmost", True)
-        win_origin.configure(bg="#0d1a12")
-        tk.Label(
-            win_origin,
-            text="0,0",
-            bg="#0d1a12",
-            fg="#00ff88",
-            font=("Segoe UI", 9, "bold"),
-        ).pack(fill=tk.BOTH, expand=True)
+    def disp_to_ix(xc: float, yc: float) -> tuple[int, int]:
+        return max(0, min(iw - 1, int(xc / scale))), max(0, min(ih - 1, int(yc / scale)))
 
-        win_handle = tk.Toplevel(root)
-        win_handle.overrideredirect(True)
-        win_handle.attributes("-topmost", True)
-        hfr = tk.Frame(win_handle, bg="#2a5ad6", bd=1, highlightthickness=1, highlightbackground="#ffffff")
-        hfr.pack(fill=tk.BOTH, expand=True)
+    def ix_to_canvas(ix: float, iy: float) -> tuple[float, float]:
+        return ix * scale, iy * scale
 
-        tw, th = 460, 72
-        tx = max(0, (sw_i - tw) // 2)
-        ty = max(0, sh_i - th - 16)
+    def clamp_rect(ix: float, iy: float, iw_r: float, ih_r: float) -> tuple[int, int, int, int]:
+        w_, h_ = max(16, min(int(iw_r), iw)), max(16, min(int(ih_r), ih))
+        x_, y_ = int(ix), int(iy)
+        if x_ + w_ > iw:
+            x_ = iw - w_
+        if y_ + h_ > ih:
+            y_ = ih - h_
+        x_, y_ = max(0, x_), max(0, y_)
+        return x_, y_, w_, h_
 
-        toolbar = tk.Toplevel(root)
-        toolbar.title("Anker — Bedienung")
-        toolbar.attributes("-topmost", True)
-        toolbar.resizable(False, False)
-        toolbar.geometry(f"{tw}x{th}+{tx}+{ty}")
-        toolbar.configure(bg="#101010")
-        bf = tk.Frame(toolbar, bg="#101010", padx=10, pady=10)
-        bf.pack(fill=tk.BOTH, expand=True)
-        btn_row = tk.Frame(bf, bg="#101010")
-        btn_row.pack()
+    rw_des = min(120, max(48, iw - 16))
+    rh_des = min(80, max(48, ih - 16))
+    ix0 = max(0, min(iw // 10, iw - rw_des))
+    iy0 = max(0, min(ih // 10, ih - rh_des))
+    ix0, iy0, rw, rh = clamp_rect(ix0, iy0, rw_des, rh_des)
+    print(
+        f"[V3] anchor calibration: rectangle initial x={ix0} y={iy0} w={rw} h={rh}",
+        flush=True,
+    )
 
-        all_wins: list[tk.Toplevel] = [
-            win_top,
-            win_bottom,
-            win_left,
-            win_right,
-            win_origin,
-            win_handle,
-            toolbar,
-        ]
+    x1, y1 = ix_to_canvas(ix0, iy0)
+    rect_id = canvas.create_rectangle(
+        x1, y1, x1 + rw * scale, y1 + rh * scale, outline="#ff2020", width=4
+    )
 
-        def sync_geometry() -> None:
-            fl = int(frame["left"])
-            ft = int(frame["top"])
-            fw = int(frame["w"])
-            fh = int(frame["h"])
-            win_top.geometry(f"{fw}x{THICK}+{fl}+{ft}")
-            win_bottom.geometry(f"{fw}x{THICK}+{fl}+{ft + fh - THICK}")
-            win_left.geometry(f"{THICK}x{fh}+{fl}+{ft}")
-            win_right.geometry(f"{THICK}x{fh}+{fl + fw - THICK}+{ft}")
+    HANDLE = 18
+    br_id = canvas.create_rectangle(0, 0, HANDLE, HANDLE, outline="#e8f0ff", fill="#2a5ad6", width=2)
+    br_diag1 = canvas.create_line(0, 0, 0, 0, fill="#ffffff", width=2)
+    br_diag2 = canvas.create_line(0, 0, 0, 0, fill="#ffffff", width=2)
 
-            ox = max(0, fl - 6)
-            oy = max(0, ft - 6)
-            win_origin.geometry(f"{ORIGIN_SZ}x{ORIGIN_SZ}+{ox}+{oy}")
-            win_handle.geometry(f"{HANDLE_SZ}x{HANDLE_SZ}+{fl + fw - HANDLE_SZ}+{ft + fh - HANDLE_SZ}")
+    ORIGIN_ARM = max(6, int(8 * scale))
+    origin_cross_h = canvas.create_line(0, 0, 0, 0, fill="#00c853", width=3)
+    origin_cross_v = canvas.create_line(0, 0, 0, 0, fill="#00c853", width=3)
+    origin_ring = canvas.create_oval(0, 0, 0, 0, outline="#004d1a", width=2, fill="#b9f6ca")
+    origin_label = canvas.create_text(
+        0, 0, text="0,0", anchor=tk.NW, fill="#1b5e20", font=("Segoe UI", 9, "bold")
+    )
 
-            for bw in (win_top, win_bottom, win_left, win_right, win_origin, win_handle):
-                try:
-                    bw.lift()
-                except tk.TclError:
-                    pass
-            try:
-                toolbar.lift()
-            except tk.TclError:
-                pass
+    def sync_handle() -> None:
+        bx1, by1, bx2, by2 = canvas.coords(rect_id)
+        canvas.coords(br_id, bx2 - HANDLE, by2 - HANDLE, bx2, by2)
+        hx1, hy1, hx2, hy2 = canvas.coords(br_id)
+        canvas.coords(br_diag1, hx1 + 4, hy1 + 4, hx2 - 4, hy2 - 4)
+        canvas.coords(br_diag2, hx1 + 4, hy2 - 4, hx2 - 4, hy1 + 4)
 
-        def on_border_press(ev: tk.Event) -> None:
-            if str(interaction["mode"]) != "idle":
-                return
-            interaction["mode"] = "move"
-            interaction["x0"] = int(ev.x_root)
-            interaction["y0"] = int(ev.y_root)
-            interaction["fl0"] = int(frame["left"])
-            interaction["ft0"] = int(frame["top"])
+    def sync_origin_marker() -> None:
+        bx1, by1, *_rest = canvas.coords(rect_id)
+        bx1, by1 = float(bx1), float(by1)
+        canvas.coords(origin_cross_h, bx1 - ORIGIN_ARM, by1, bx1 + ORIGIN_ARM, by1)
+        canvas.coords(origin_cross_v, bx1, by1 - ORIGIN_ARM, bx1, by1 + ORIGIN_ARM)
+        pr = max(3.0, 4.0 * scale)
+        canvas.coords(origin_ring, bx1 - pr, by1 - pr, bx1 + pr, by1 + pr)
+        canvas.coords(origin_label, bx1 + ORIGIN_ARM + 4, by1 + 2)
 
-        def on_border_motion(ev: tk.Event) -> None:
-            if str(interaction["mode"]) != "move":
-                return
-            x0 = int(interaction["x0"])
-            y0 = int(interaction["y0"])
-            nl = int(interaction["fl0"]) + int(ev.x_root) - x0
-            nt = int(interaction["ft0"]) + int(ev.y_root) - y0
-            fw = int(frame["w"])
-            fh = int(frame["h"])
-            nl = max(0, min(nl, sw_i - fw))
-            nt = max(0, min(nt, sh_i - fh))
-            frame["left"] = nl
-            frame["top"] = nt
-            sync_geometry()
+    state: dict[str, float | int | str] = {
+        "mode": "idle",
+        "dx": 0.0,
+        "dy": 0.0,
+        "corner_xoff": HANDLE / 2.0,
+        "corner_yoff": HANDLE / 2.0,
+        "fix_ix": 0,
+        "fix_iy": 0,
+        "w": rw,
+        "h": rh,
+    }
 
-        def on_handle_press(ev: tk.Event) -> None:
-            if str(interaction["mode"]) != "idle":
-                return
-            interaction["mode"] = "resize"
-            interaction["x0"] = int(ev.x_root)
-            interaction["y0"] = int(ev.y_root)
-            interaction["w0"] = int(frame["w"])
-            interaction["h0"] = int(frame["h"])
+    def canvas_rect_to_ixy() -> tuple[int, int, int, int]:
+        bx1, by1, bx2, by2 = canvas.coords(rect_id)
+        xa, ya = disp_to_ix(bx1, by1)
+        xb, yb = disp_to_ix(bx2, by2)
+        if xb <= xa:
+            xb = xa + 16
+        if yb <= ya:
+            yb = ya + 16
+        return clamp_rect(xa, ya, xb - xa, yb - ya)
 
-        def on_handle_motion(ev: tk.Event) -> None:
-            if str(interaction["mode"]) != "resize":
-                return
-            nw = max(32, int(interaction["w0"]) + int(ev.x_root) - int(interaction["x0"]))
-            nh = max(32, int(interaction["h0"]) + int(ev.y_root) - int(interaction["y0"]))
-            fl = int(frame["left"])
-            ft = int(frame["top"])
-            nw = min(nw, sw_i - fl)
-            nh = min(nh, sh_i - ft)
-            frame["w"] = nw
-            frame["h"] = nh
-            sync_geometry()
+    def apply_ix(ix: int, iy: int, w_: int, h_: int) -> None:
+        cx1_, cy1_ = ix_to_canvas(ix, iy)
+        cx2_, cy2_ = ix_to_canvas(ix + w_, iy + h_)
+        canvas.coords(rect_id, cx1_, cy1_, cx2_, cy2_)
+        canvas.itemconfig(rect_id, outline="#ff2020", width=4)
+        sync_handle()
+        sync_origin_marker()
 
-        def on_any_release(_ev: tk.Event | None = None) -> None:
-            interaction["mode"] = "idle"
+    def on_canvas_down(ev: tk.Event) -> None:
+        cx, cy = canvas.canvasx(ev.x), canvas.canvasy(ev.y)
+        bx1, by1, bx2, by2 = canvas.coords(rect_id)
+        hx1, hy1, hx2, hy2 = canvas.coords(br_id)
+        if hx1 <= cx <= hx2 and hy1 <= cy <= hy2:
+            ix_q, iy_q, _, _ = canvas_rect_to_ixy()
+            state["mode"] = "resize"
+            state["corner_xoff"] = float(cx - bx2)
+            state["corner_yoff"] = float(cy - by2)
+            state["fix_ix"] = ix_q
+            state["fix_iy"] = iy_q
+        elif bx1 <= cx <= bx2 and by1 <= cy <= by2:
+            _, _, ww_, hh_ = canvas_rect_to_ixy()
+            state["mode"] = "move"
+            state["dx"] = cx - bx1
+            state["dy"] = cy - by1
+            state["w"] = ww_
+            state["h"] = hh_
+        else:
+            state["mode"] = "idle"
 
-        for w in (win_top, win_bottom, win_left, win_right, win_origin):
-            w.bind("<ButtonPress-1>", on_border_press)
-            w.bind("<B1-Motion>", on_border_motion)
-            w.bind("<ButtonRelease-1>", on_any_release)
-
-        win_handle.bind("<ButtonPress-1>", on_handle_press)
-        win_handle.bind("<B1-Motion>", on_handle_motion)
-        win_handle.bind("<ButtonRelease-1>", on_any_release)
-
-        def close_cancel() -> None:
-            if result["closing"]:
-                return
-            result["closing"] = True
-            print("[V3] anchor calibration: cancelled", flush=True)
-            _destroy_windows(all_wins)
-
-        def save_anchor() -> None:
-            fl, ft, fw, fh = (
-                int(frame["left"]),
-                int(frame["top"]),
-                int(frame["w"]),
-                int(frame["h"]),
+    def on_canvas_motion(ev: tk.Event) -> None:
+        cx, cy = canvas.canvasx(ev.x), canvas.canvasy(ev.y)
+        m = str(state["mode"])
+        if m == "move":
+            nx1_canvas = cx - float(state["dx"])
+            ny1_canvas = cy - float(state["dy"])
+            nix, niy = disp_to_ix(nx1_canvas, ny1_canvas)
+            ni, nj, nk, nh = clamp_rect(
+                float(nix), float(niy), float(int(state["w"])), float(int(state["h"]))
             )
-            if fw < 8 or fh < 8:
-                messagebox.showwarning("Anker", "Bereich zu klein.", parent=toolbar)
-                return
-            left, top = fl, ft
-            right_ex = left + fw
-            bottom_ex = top + fh
-            x1, y1, x2, y2 = left, top, right_ex - 1, bottom_ex - 1
+            apply_ix(ni, nj, nk, nh)
+        elif m == "resize":
+            target_x2 = cx - float(state["corner_xoff"])
+            target_y2 = cy - float(state["corner_yoff"])
+            br_x, br_y = disp_to_ix(target_x2, target_y2)
+            fi, fj = int(state["fix_ix"]), int(state["fix_iy"])
+            ni, nj, nk, nh = clamp_rect(float(fi), float(fj), float(br_x - fi), float(br_y - fj))
+            apply_ix(ni, nj, nk, nh)
+
+    def on_canvas_release(_ev: tk.Event) -> None:
+        state["mode"] = "idle"
+
+    canvas.bind("<ButtonPress-1>", on_canvas_down)
+    canvas.bind("<B1-Motion>", on_canvas_motion)
+    canvas.bind("<ButtonRelease-1>", on_canvas_release)
+    sync_handle()
+    sync_origin_marker()
+
+    bf = tk.Frame(dlg)
+    bf.pack(fill=tk.X, pady=(8, 10))
+
+    def close_cancel() -> None:
+        if result["closing"]:
+            return
+        result["closing"] = True
+        print("[V3] anchor calibration cancelled", flush=True)
+        _safe_grab_release(dlg)
+        try:
+            dlg.destroy()
+        except tk.TclError:
+            pass
+
+    def save_anchor() -> None:
+        ix, iy_, w_, h_ = canvas_rect_to_ixy()
+        if w_ < 8 or h_ < 8:
+            messagebox.showwarning(
+                "Kalibrierung", "Ankerbereich zu klein (min. ~8 Pixel).", parent=dlg
+            )
+            return
+        canvas.itemconfigure(rect_id, state="hidden")
+        canvas.itemconfigure(br_id, state="hidden")
+        canvas.itemconfigure(br_diag1, state="hidden")
+        canvas.itemconfigure(br_diag2, state="hidden")
+        canvas.itemconfigure(origin_cross_h, state="hidden")
+        canvas.itemconfigure(origin_cross_v, state="hidden")
+        canvas.itemconfigure(origin_ring, state="hidden")
+        canvas.itemconfigure(origin_label, state="hidden")
+        dlg.update_idletasks()
+        dlg.update()
+
+        try:
+            left, top, right, bottom = ix, iy_, ix + w_, iy_ + h_
+            crop = pil_img.crop((left, top, right, bottom))
+            ANCHORS_DIR.mkdir(parents=True, exist_ok=True)
+            crop.save(str(ANCHOR_PATCH_PATH), format="PNG", optimize=True)
+
+            cfg = {
+                "schema": ANCHOR_SCHEMA,
+                "created_at": datetime.now().isoformat(timespec="seconds"),
+                "anchor_name": "table_anchor",
+                "anchor_width": w_,
+                "anchor_height": h_,
+                "origin": "top_left",
+                "origin_pixel": {"x": 0, "y": 0},
+                "origin_screen_hint": "top_left_of_rectangle",
+                "resize_handle": "bottom_right",
+                "source_screenshot": str(img_path),
+                "note": "Nullpunkt ist oben links im gespeicherten Anker-Patch.",
+            }
+            ANCHOR_CONFIG_PATH.write_text(
+                json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+            print(f"[V3] anchor origin: top_left x={left} y={top}", flush=True)
             print(
-                f"[V3] anchor calibration: grab screen bbox left={left} top={top} right_ex={right_ex} bottom_ex={bottom_ex}",
+                f"[V3] anchor crop: left={left} top={top} right={right} bottom={bottom}",
                 flush=True,
             )
+            print(f"[V3] anchor saved: {ANCHOR_PATCH_PATH}", flush=True)
+            print(f"[V3] anchor config saved: {ANCHOR_CONFIG_PATH}", flush=True)
+        except OSError as ex:
+            traceback.print_exc()
+            print(f"[V3][ERROR] anchor calibration failed: {ex}", flush=True)
             try:
-                for w in all_wins:
-                    try:
-                        w.withdraw()
-                    except tk.TclError:
-                        pass
-                root.update_idletasks()
-                root.update()
-                time.sleep(0.15)
-                try:
-                    im = ImageGrab.grab(
-                        bbox=(left, top, right_ex, bottom_ex), all_screens=True
-                    )
-                except TypeError:
-                    im = ImageGrab.grab(bbox=(left, top, right_ex, bottom_ex))
-            except Exception as ex:
-                traceback.print_exc()
-                print(f"[V3][ERROR] anchor grab failed: {ex}", flush=True)
-                for w in all_wins:
-                    try:
-                        w.deiconify()
-                    except tk.TclError:
-                        pass
-                sync_geometry()
-                try:
-                    messagebox.showerror("Anker", f"Screenshot fehlgeschlagen:\n{ex}", parent=toolbar)
-                except tk.TclError:
-                    pass
-                return
-
-            try:
-                ANCHORS_DIR.mkdir(parents=True, exist_ok=True)
-                im.save(str(ANCHOR_PATCH_PATH), format="PNG", optimize=True)
-                cfg = {
-                    "schema": ANCHOR_SCHEMA,
-                    "created_at": datetime.now().isoformat(timespec="seconds"),
-                    "anchor_name": "table_anchor",
-                    "origin": "top_left",
-                    "origin_screen_hint": "top_left_of_rectangle",
-                    "resize_handle": "bottom_right",
-                    "origin_pixel": {"x": 0, "y": 0},
-                    "anchor_width": fw,
-                    "anchor_height": fh,
-                    "capture_rect_screen": {"x1": x1, "y1": y1, "x2": x2, "y2": y2},
-                    "calibration_mode": "border_frame",
-                    "note": "Nullpunkt = oben links im gespeicherten Patch (= linke obere Ecke des Rahmens).",
-                }
-                ANCHOR_CONFIG_PATH.write_text(
-                    json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8"
+                messagebox.showerror(
+                    "Kalibrierung",
+                    f"Konnte nicht speichern:\n{ex}",
+                    parent=dlg,
                 )
-                print(f"[V3] anchor saved: {ANCHOR_PATCH_PATH}", flush=True)
-                print(f"[V3] anchor config saved: {ANCHOR_CONFIG_PATH}", flush=True)
-            except OSError as ex:
-                traceback.print_exc()
-                print(f"[V3][ERROR] anchor save failed: {ex}", flush=True)
-                try:
-                    messagebox.showerror("Anker", f"Speichern fehlgeschlagen:\n{ex}", parent=toolbar)
-                except tk.TclError:
-                    pass
-                for w in all_wins:
-                    try:
-                        w.deiconify()
-                    except tk.TclError:
-                        pass
-                sync_geometry()
-                return
-
-            result["saved"] = True
-            result["closing"] = True
-            _destroy_windows(all_wins)
-
-        tk.Button(btn_row, text="Abbrechen", command=close_cancel, width=12).pack(side=tk.LEFT, padx=6)
-        tk.Button(btn_row, text="Anker speichern", command=save_anchor, width=16).pack(side=tk.LEFT, padx=6)
-
-        toolbar.protocol("WM_DELETE_WINDOW", close_cancel)
-
-        sync_geometry()
-        root.update_idletasks()
-        root.update()
-        for w in all_wins:
-            try:
-                w.deiconify()
             except tk.TclError:
                 pass
-        sync_geometry()
-        print("[V3] anchor frame: visible (borders + toolbar)", flush=True)
+            return
 
-        if modal:
-            print("[V3] anchor frame: wait_window(toolbar)", flush=True)
-            toolbar.wait_window()
+        result["saved"] = True
+        result["closing"] = True
+        _safe_grab_release(dlg)
+        try:
+            dlg.destroy()
+        except tk.TclError:
+            pass
 
-        print("[V3] anchor frame: done", flush=True)
-        return bool(result.get("saved"))
+    tk.Button(bf, text="Abbrechen", command=close_cancel).pack(side=tk.RIGHT, padx=10)
+    tk.Button(bf, text="Anker speichern", command=save_anchor).pack(side=tk.RIGHT, padx=10)
 
-    except Exception as exc:
-        traceback.print_exc()
-        print(f"[V3][ERROR] overlay failed: {exc}", flush=True, file=sys.stderr)
-        return False
+    def on_wm_close() -> None:
+        print("[V3] anchor calibration window closed", flush=True)
+        close_cancel()
+
+    dlg.protocol("WM_DELETE_WINDOW", on_wm_close)
+
+    try:
+        dlg.grab_set()
+    except tk.TclError:
+        pass
+
+    root.lift()
+    dlg.update_idletasks()
+    dlg.update()
+    ww = dlg.winfo_reqwidth()
+    wh = dlg.winfo_reqheight()
+    gx = max(0, (sw - ww) // 2)
+    gy = max(0, (sh - wh) // 6)
+    dlg.geometry(f"{ww}x{wh}+{gx}+{gy}")
+    dlg.lift()
+    dlg.attributes("-topmost", True)
+
+    def _dlg_top_off() -> None:
+        try:
+            dlg.attributes("-topmost", False)
+        except tk.TclError:
+            pass
+
+    dlg.after(400, _dlg_top_off)
+
+    try:
+        dlg.focus_force()
+    except Exception:
+        pass
+
+    print("[V3] anchor calibration: Tk window visible", flush=True)
+    if modal:
+        print("[V3] anchor calibration: entering wait_window", flush=True)
+        dlg.wait_window()
+        print("[V3] anchor calibration: wait_window returned", flush=True)
+
+    return bool(result.get("saved"))

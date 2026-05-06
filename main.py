@@ -513,6 +513,26 @@ def kill_snipping_process(proc: subprocess.Popen | None) -> None:
         pass
 
 
+def compute_region_summary(
+    region_history: dict[str, list[dict]],
+    aggregate_by_region: dict[str, dict],
+) -> dict[str, dict]:
+    """first_seen_scan / last_seen_scan / hit_count / current_value aus Historie."""
+    summary: dict[str, dict] = {}
+    for name, hist in region_history.items():
+        if not hist:
+            continue
+        scans_idxs = [int(e["scan_index"]) for e in hist]
+        cur = aggregate_by_region.get(name, {})
+        summary[name] = {
+            "current_value": cur.get("value", hist[-1]["value"]),
+            "first_seen_scan": min(scans_idxs),
+            "last_seen_scan": max(scans_idxs),
+            "hit_count": len(hist),
+        }
+    return summary
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Tablemap Scanner V3 (Snipping Tool → Clipboard)")
     parser.add_argument(
@@ -565,6 +585,7 @@ def main() -> int:
 
     scans: list[dict] = []
     aggregate_by_region: dict[str, dict] = {}
+    region_history: dict[str, list[dict]] = {}
     tokens_latest: list[dict] = []
     stats_latest: dict[str, int] = {"region_count": 0, "remaining_text_lines": 0}
     results_toplevel: tk.Toplevel | None = None
@@ -622,6 +643,8 @@ def main() -> int:
             }
             for name, d in sorted(aggregate_by_region.items())
         ]
+        region_summary = compute_region_summary(region_history, aggregate_by_region)
+        region_history_ordered = dict(sorted(region_history.items()))
         payload = {
             "schema": "pokerth_tablemap_v3_aggregate",
             "generated_at": datetime.now().isoformat(timespec="seconds"),
@@ -634,6 +657,8 @@ def main() -> int:
             "region_count_aggregate": len(aggregate_by_region),
             "remaining_text_lines_latest": stats_latest.get("remaining_text_lines", 0),
             "scans": list(scans),
+            "region_history": region_history_ordered,
+            "region_summary": dict(sorted(region_summary.items())),
         }
         out_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
         print("[V3] final export written:", out_path, flush=True)
@@ -670,8 +695,8 @@ def main() -> int:
             results_toplevel = tk.Toplevel(root)
             results_window = results_toplevel
             results_window.title("Tablemap Scanner V3 - Ergebnisse")
-            results_window.geometry("800x780")
-            results_window.minsize(620, 620)
+            results_window.geometry("860x860")
+            results_window.minsize(620, 680)
             results_window.transient(root)
 
             results_window.protocol("WM_DELETE_WINDOW", _close_results_only)
@@ -714,6 +739,72 @@ def main() -> int:
             d = aggregate_by_region[name]
             mark = "*" if d["catalog_match"] else "?"
             lb.insert(tk.END, f"{mark} {name}  →  {d['value']}")
+
+        region_summary = compute_region_summary(region_history, aggregate_by_region)
+        summary_lines: list[str] = []
+        for name in sorted(region_summary.keys()):
+            s = region_summary[name]
+            summary_lines.append(
+                f"{name} → aktuell: {s['current_value']} | zuerst: Scan {s['first_seen_scan']} | "
+                f"zuletzt: Scan {s['last_seen_scan']} | Treffer: {s['hit_count']}"
+            )
+        tk.Label(body, text="Gesamt-Stats-Historie", font=("Segoe UI", 10, "bold")).pack(
+            anchor="w", pady=(10, 2)
+        )
+        sumf = tk.Frame(body)
+        sumf.pack(fill=tk.BOTH, expand=True, pady=(0, 4))
+        sum_sb = tk.Scrollbar(sumf)
+        sum_txt = tk.Text(
+            sumf,
+            height=7,
+            width=96,
+            wrap=tk.WORD,
+            font=("Consolas", 9),
+            yscrollcommand=sum_sb.set,
+            state=tk.DISABLED,
+        )
+        sum_sb.config(command=sum_txt.yview)
+        sum_sb.pack(side=tk.RIGHT, fill=tk.Y)
+        sum_txt.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        sum_txt.config(state=tk.NORMAL)
+        sum_txt.insert(
+            "1.0",
+            "\n".join(summary_lines) if summary_lines else "(noch keine Regionen-Historie)",
+        )
+        sum_txt.config(state=tk.DISABLED)
+
+        detail_blocks: list[str] = []
+        for name in sorted(region_history.keys()):
+            lines = [f"{name}:"]
+            for e in region_history[name]:
+                lines.append(
+                    f"  Scan {e['scan_index']} @ {e['created_at']} → {e['value']}"
+                )
+            detail_blocks.append("\n".join(lines))
+        tk.Label(body, text="Detail-Historie pro Region", font=("Segoe UI", 10, "bold")).pack(
+            anchor="w", pady=(8, 2)
+        )
+        dtf = tk.Frame(body)
+        dtf.pack(fill=tk.BOTH, expand=True, pady=(0, 4))
+        dt_sb = tk.Scrollbar(dtf)
+        dt_txt = tk.Text(
+            dtf,
+            height=9,
+            width=96,
+            wrap=tk.WORD,
+            font=("Consolas", 9),
+            yscrollcommand=dt_sb.set,
+            state=tk.DISABLED,
+        )
+        dt_sb.config(command=dt_txt.yview)
+        dt_sb.pack(side=tk.RIGHT, fill=tk.Y)
+        dt_txt.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        dt_txt.config(state=tk.NORMAL)
+        dt_txt.insert(
+            "1.0",
+            "\n\n".join(detail_blocks) if detail_blocks else "(noch keine Einträge)",
+        )
+        dt_txt.config(state=tk.DISABLED)
 
         text_lines = [
             token_full_text(t)
@@ -814,7 +905,7 @@ def main() -> int:
 
     def process_clipboard_and_show() -> None:
         nonlocal clipboard_text, _processing_results, baseline, proc, polling_active
-        nonlocal scans, aggregate_by_region, tokens_latest, stats_latest
+        nonlocal scans, aggregate_by_region, region_history, tokens_latest, stats_latest
         if _processing_results or not clipboard_text:
             print(
                 "[V3] process_clipboard_and_show skipped:",
@@ -836,18 +927,28 @@ def main() -> int:
             regions, stats = group_tokens_into_regions(tokens)
             print(f"[V3] scan #{scan_no} tokens:", len(tokens), flush=True)
             print(f"[V3] scan #{scan_no} regions:", len(regions), flush=True)
+            ts = datetime.now().isoformat(timespec="seconds")
             for r in regions:
                 aggregate_by_region[r["region_name"]] = {
                     "value": r["value"],
                     "catalog_match": r["catalog_match"],
                 }
+                region_history.setdefault(r["region_name"], []).append(
+                    {
+                        "scan_index": scan_no,
+                        "created_at": ts,
+                        "value": r["value"],
+                    }
+                )
             print("[V3] aggregate regions:", len(aggregate_by_region), flush=True)
+            print(f"[V3] region history updated: {len(regions)}", flush=True)
+            print(f"[V3] region summary entries: {len(region_history)}", flush=True)
             tokens_latest = tokens
             stats_latest = dict(stats)
             scans.append(
                 {
                     "scan_index": scan_no,
-                    "created_at": datetime.now().isoformat(timespec="seconds"),
+                    "created_at": ts,
                     "clipboard_raw": current,
                     "token_count": len(tokens),
                     "region_count": stats["region_count"],

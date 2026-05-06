@@ -1,6 +1,6 @@
 """
 Tablemap Scanner V3 — Clipboard-only pipeline via Windows Snipping Tool „Text aus Bild kopieren“.
-Optional: --calibrate-anchor = transparentes Desktop-Overlay zum Setzen des Tabellen-Ankers.
+Optional: --calibrate-anchor = topmost Randfenster-Rahmen auf dem Desktop; Snipping unverändert.
 """
 
 from __future__ import annotations

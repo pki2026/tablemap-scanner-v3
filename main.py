@@ -1931,6 +1931,8 @@ def main() -> int:
                 geom["snipping_text_boxes"],
                 region_boxes,
                 repo_root,
+                box_layout_zones=map_bundle.get("box_layout_zones"),
+                ignored_snipping_boxes=ignored_boxes,
             )
             if dbg_p is not None:
                 print(f"[V3] mapping debug: {dbg_p}", flush=True)

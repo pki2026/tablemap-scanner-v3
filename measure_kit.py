@@ -253,6 +253,18 @@ def filter_boxes_for_mapping(
             row["ignored_reason"] = "too_small"
             ignored.append(row)
             continue
+        max_map_area_ratio = 0.32
+        max_map_w_ratio = 0.55
+        max_map_h_ratio = 0.50
+        if (
+            area > max_map_area_ratio * img_area
+            or w > max_map_w_ratio * img_w
+            or h > max_map_h_ratio * img_h
+        ):
+            row = dict(b)
+            row["ignored_reason"] = "too_large_for_region_mapping"
+            ignored.append(row)
+            continue
         usable.append(b)
     usable.sort(key=lambda bb: (bb["abs"]["y1"], bb["abs"]["x1"]))
     return usable, ignored
@@ -297,20 +309,39 @@ def _box_norm_center(abs_box: dict, img_w: int, img_h: int) -> tuple[float, floa
 
 def classify_box_layout_zone(abs_box: dict, img_w: int, img_h: int) -> str:
     """
-    Heuristik: Game/Hand oben, Buttons unten, Pot in der Mitte, sonst Spieler am Umlauf.
+    Heuristik: Game/Hand oben, p5/p6 oben links/mitte, Hero (p0) unten mitte,
+    Buttons als unterste Leiste, Pot zentral, sonst Sitz-Umlauf (leicht versetzt).
     """
     cx, cy = _box_norm_center(abs_box, img_w, img_h)
-    if cy < 0.32 and cx < 0.62:
-        return "game_hand"
-    if cy > 0.70 and 0.18 < cx < 0.82:
-        return "button"
-    if math.hypot(cx - 0.5, cy - 0.5) < 0.20:
-        return "pot"
     dx, dy = cx - 0.5, cy - 0.5
-    if abs(dx) + abs(dy) < 0.045:
+    dist = math.hypot(dx, dy)
+
+    if cy < 0.35 and cx < 0.66:
+        return "game_hand"
+
+    if cy < 0.44:
+        if cx < 0.34:
+            return "player_5"
+        if cx < 0.53 and cy < 0.43:
+            return "player_6"
+
+    if cy > 0.60 and abs(cx - 0.5) < 0.38 and 0.10 < dist < 0.52:
+        if cy > 0.64 or abs(cx - 0.5) < 0.26:
+            return "player_0"
+
+    if cy > 0.82 and 0.14 < cx < 0.86:
+        return "button"
+    if cy > 0.70 and 0.20 < cx < 0.80 and dist > 0.38:
+        return "button"
+
+    if dist < 0.185:
         return "pot"
+    if abs(dx) + abs(dy) < 0.038:
+        return "pot"
+
     ang = math.atan2(dy, dx)
-    t = (math.pi / 2 - ang) / (2 * math.pi / 10)
+    seat_phase = 0.14
+    t = (math.pi / 2 - ang + seat_phase) / (2 * math.pi / 10)
     seat = int(round(t)) % 10
     return f"player_{seat}"
 
@@ -517,8 +548,13 @@ def build_region_boxes(
             "rel": None,
             "geometry_status": "unmatched",
             "box_layout_zone": None,
+            "unmatched_reason": None,
         }
-        if not allow_match or not sti:
+        if not allow_match:
+            out.append(entry)
+            continue
+        if not sti:
+            entry["unmatched_reason"] = "no_source_tokens"
             out.append(entry)
             continue
         box_ids: list[int] = []
@@ -539,6 +575,7 @@ def build_region_boxes(
         blz = (mapping.get("box_layout_zones") or {}).get(str(bi))
         exp_z = entry.get("layout_zone")
         if exp_z is not None and blz is not None and blz != exp_z:
+            entry["unmatched_reason"] = "layout_zone_mismatch"
             out.append(entry)
             continue
         entry["box_index"] = bi
@@ -555,33 +592,75 @@ def save_mapping_debug_image(
     snipping_text_boxes: list[dict],
     region_boxes: list[dict],
     repo_root: Path,
+    *,
+    box_layout_zones: dict[str, str] | None = None,
+    ignored_snipping_boxes: list[dict] | None = None,
 ) -> Path | None:
-    """Optional: alle Boxen mit Index; bei gematchten Regionen region_name anhängen."""
+    """
+    Debug: box_index, box_layout_zone, gematchte region_name;
+    ignorierte Boxen mit ignored_reason (andere Farbe).
+    """
     img = cv2.imread(str(capture_path))
     if img is None:
         return None
+    zl = box_layout_zones or {}
+
     box_to_regions: dict[int, list[str]] = {}
     for rb in region_boxes:
+        if rb.get("geometry_status") != "matched":
+            continue
         bi = rb.get("box_index")
         if bi is None:
             continue
         box_to_regions.setdefault(int(bi), []).append(str(rb["region_name"]))
 
+    ignored_idx = {int(x["box_index"]) for x in (ignored_snipping_boxes or [])}
+
     for b in snipping_text_boxes:
         bi = int(b["box_index"])
+        if bi in ignored_idx:
+            continue
         a = b["abs"]
         x1, y1, x2, y2 = int(a["x1"]), int(a["y1"]), int(a["x2"]), int(a["y2"])
         cv2.rectangle(img, (x1, y1), (x2, y2), (0, 200, 0), 2)
-        label = str(bi)
+        zone = zl.get(str(bi), "?")
+        line1 = f"{bi} z={zone}"
         names = box_to_regions.get(bi)
-        if names:
-            label += " " + ",".join(names[:3])
+        line2 = ",".join(names[:4]) if names else ""
         cv2.putText(
             img,
-            label,
+            line1,
+            (x1, max(14, y1 - 6)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.38,
+            (0, 220, 255),
+            1,
+            cv2.LINE_AA,
+        )
+        if line2:
+            cv2.putText(
+                img,
+                line2[:60],
+                (x1, max(28, y1 + 10)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.36,
+                (180, 255, 180),
+                1,
+                cv2.LINE_AA,
+            )
+
+    for ign in ignored_snipping_boxes or []:
+        bi = int(ign["box_index"])
+        a = ign["abs"]
+        x1, y1, x2, y2 = int(a["x1"]), int(a["y1"]), int(a["x2"]), int(a["y2"])
+        cv2.rectangle(img, (x1, y1), (x2, y2), (0, 100, 255), 2)
+        reason = str(ign.get("ignored_reason", ""))
+        cv2.putText(
+            img,
+            f"{bi} IGN {reason}"[:72],
             (x1, max(14, y1 - 3)),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.42,
+            0.36,
             (0, 220, 255),
             1,
             cv2.LINE_AA,

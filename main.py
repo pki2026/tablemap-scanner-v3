@@ -21,6 +21,7 @@ import win32con
 
 
 POLL_INTERVAL_MS = 500
+MIN_POKERTH_CLIPBOARD_CHARS = 50
 TOKEN_BBOX = {"x": 0, "y": 0, "w": 100, "h": 20}
 TOKEN_CONFIDENCE = 95
 
@@ -533,6 +534,60 @@ def compute_region_summary(
     return summary
 
 
+def is_valid_pokerth_scan(clipboard_text: str, regions: list[dict]) -> bool:
+    """Kein Merge, wenn keine Regionen oder Text offensichtlich zu kurz."""
+    if len(regions) == 0:
+        return False
+    if len(clipboard_text.strip()) < MIN_POKERTH_CLIPBOARD_CHARS:
+        return False
+    return True
+
+
+def readonly_copyable_text_finalize(w: tk.Text, app: tk.Misc) -> None:
+    """state=normal, Bearbeitung blockiert, Auswahl + Ctrl+C / Ctrl+A möglich."""
+    nav_keys = frozenset(
+        {
+            "Left",
+            "Right",
+            "Up",
+            "Down",
+            "Home",
+            "End",
+            "Next",
+            "Prior",
+            "Shift_L",
+            "Shift_R",
+            "Control_L",
+            "Control_R",
+            "Alt_L",
+            "Alt_R",
+        }
+    )
+
+    def on_key(ev: tk.Event) -> str | None:
+        ks = ev.keysym
+        if ev.state & 0x0004:
+            low = ks.lower()
+            if low == "c" or ks == "Insert":
+                try:
+                    if w.tag_ranges(tk.SEL):
+                        app.clipboard_clear()
+                        app.clipboard_append(w.get(tk.SEL_FIRST, tk.SEL_LAST))
+                except tk.TclError:
+                    pass
+                return "break"
+            if low == "a":
+                w.tag_remove(tk.SEL, "1.0", tk.END)
+                w.tag_add(tk.SEL, "1.0", tk.END + "-1c")
+                return "break"
+        if ks in nav_keys:
+            return None
+        return "break"
+
+    w.configure(state="normal")
+    w.bind("<Key>", on_key, add=True)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Tablemap Scanner V3 (Snipping Tool → Clipboard)")
     parser.add_argument(
@@ -711,35 +766,6 @@ def main() -> int:
         assert results_body_frame is not None
         body = results_body_frame
 
-        hdr = tk.Label(
-            body,
-            text=(
-                f"Sammel-Scans: {n_scans}   "
-                f"Aktuelle Regionen: {n_regions}   "
-                f"Letzte Token-Anzahl: {len(tokens_latest)}   "
-                f"Freie Textzeilen (__text__, letzter Scan): {stats_latest.get('remaining_text_lines', 0)}\n"
-                f"{export_note}"
-            ),
-            justify=tk.LEFT,
-            anchor="w",
-        )
-        hdr.pack(fill=tk.X)
-
-        tk.Label(body, text="Aggregierte Regionen", font=("Segoe UI", 10, "bold")).pack(
-            anchor="w", pady=(10, 2)
-        )
-        scroll_wrap = tk.Frame(body)
-        scroll_wrap.pack(fill=tk.BOTH, expand=True, pady=(0, 4))
-        sb = tk.Scrollbar(scroll_wrap)
-        lb = tk.Listbox(scroll_wrap, height=11, width=96, yscrollcommand=sb.set, font=("Segoe UI", 10))
-        sb.config(command=lb.yview)
-        sb.pack(side=tk.RIGHT, fill=tk.Y)
-        lb.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        for name in sorted(aggregate_by_region.keys()):
-            d = aggregate_by_region[name]
-            mark = "*" if d["catalog_match"] else "?"
-            lb.insert(tk.END, f"{mark} {name}  →  {d['value']}")
-
         region_summary = compute_region_summary(region_history, aggregate_by_region)
         summary_lines: list[str] = []
         for name in sorted(region_summary.keys()):
@@ -748,6 +774,82 @@ def main() -> int:
                 f"{name} → aktuell: {s['current_value']} | zuerst: Scan {s['first_seen_scan']} | "
                 f"zuletzt: Scan {s['last_seen_scan']} | Treffer: {s['hit_count']}"
             )
+        aggregated_lines = [
+            f"{'*' if aggregate_by_region[name]['catalog_match'] else '?'} {name}  →  {aggregate_by_region[name]['value']}"
+            for name in sorted(aggregate_by_region.keys())
+        ]
+        detail_blocks: list[str] = []
+        for name in sorted(region_history.keys()):
+            lines = [f"{name}:"]
+            for e in region_history[name]:
+                lines.append(
+                    f"  Scan {e['scan_index']} @ {e['created_at']} → {e['value']}"
+                )
+            detail_blocks.append("\n".join(lines))
+        text_lines = [
+            token_full_text(t)
+            for t in tokens_latest
+            if (t.get("label") or "").strip() == "__text__"
+        ]
+        hist_lines: list[str] = []
+        for s in scans:
+            hist_lines.append(
+                f"--- Scan {s['scan_index']} @ {s['created_at']} — "
+                f"Tokens={s['token_count']}, Regionen={s['region_count']} — "
+                f"{len(s['clipboard_raw'])} Zeichen Rohdaten"
+            )
+        last_raw = scans[-1]["clipboard_raw"] if scans else ""
+
+        hdr_text = (
+            f"Sammel-Scans: {n_scans}   "
+            f"Aktuelle Regionen: {n_regions}   "
+            f"Letzte Token-Anzahl: {len(tokens_latest)}   "
+            f"Freie Textzeilen (__text__, letzter Scan): {stats_latest.get('remaining_text_lines', 0)}\n"
+            f"{export_note}"
+        )
+        tk.Label(body, text="Zusammenfassung / Status", font=("Segoe UI", 10, "bold")).pack(
+            anchor="w", pady=(0, 2)
+        )
+        hdr_f = tk.Frame(body)
+        hdr_f.pack(fill=tk.X, pady=(0, 8))
+        hdr_sb = tk.Scrollbar(hdr_f)
+        hdr_txt = tk.Text(
+            hdr_f,
+            height=4,
+            width=96,
+            wrap=tk.WORD,
+            font=("Segoe UI", 9),
+            yscrollcommand=hdr_sb.set,
+        )
+        hdr_sb.config(command=hdr_txt.yview)
+        hdr_sb.pack(side=tk.RIGHT, fill=tk.Y)
+        hdr_txt.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        hdr_txt.insert("1.0", hdr_text)
+        readonly_copyable_text_finalize(hdr_txt, root)
+
+        tk.Label(body, text="Aggregierte Regionen", font=("Segoe UI", 10, "bold")).pack(
+            anchor="w", pady=(10, 2)
+        )
+        scroll_wrap = tk.Frame(body)
+        scroll_wrap.pack(fill=tk.BOTH, expand=True, pady=(0, 4))
+        sb = tk.Scrollbar(scroll_wrap)
+        reg_txt = tk.Text(
+            scroll_wrap,
+            height=11,
+            width=96,
+            wrap=tk.WORD,
+            font=("Consolas", 9),
+            yscrollcommand=sb.set,
+        )
+        sb.config(command=reg_txt.yview)
+        sb.pack(side=tk.RIGHT, fill=tk.Y)
+        reg_txt.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        reg_txt.insert(
+            "1.0",
+            "\n".join(aggregated_lines) if aggregated_lines else "(noch keine Regionen)",
+        )
+        readonly_copyable_text_finalize(reg_txt, root)
+
         tk.Label(body, text="Gesamt-Stats-Historie", font=("Segoe UI", 10, "bold")).pack(
             anchor="w", pady=(10, 2)
         )
@@ -761,26 +863,16 @@ def main() -> int:
             wrap=tk.WORD,
             font=("Consolas", 9),
             yscrollcommand=sum_sb.set,
-            state=tk.DISABLED,
         )
         sum_sb.config(command=sum_txt.yview)
         sum_sb.pack(side=tk.RIGHT, fill=tk.Y)
         sum_txt.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        sum_txt.config(state=tk.NORMAL)
         sum_txt.insert(
             "1.0",
             "\n".join(summary_lines) if summary_lines else "(noch keine Regionen-Historie)",
         )
-        sum_txt.config(state=tk.DISABLED)
+        readonly_copyable_text_finalize(sum_txt, root)
 
-        detail_blocks: list[str] = []
-        for name in sorted(region_history.keys()):
-            lines = [f"{name}:"]
-            for e in region_history[name]:
-                lines.append(
-                    f"  Scan {e['scan_index']} @ {e['created_at']} → {e['value']}"
-                )
-            detail_blocks.append("\n".join(lines))
         tk.Label(body, text="Detail-Historie pro Region", font=("Segoe UI", 10, "bold")).pack(
             anchor="w", pady=(8, 2)
         )
@@ -794,23 +886,16 @@ def main() -> int:
             wrap=tk.WORD,
             font=("Consolas", 9),
             yscrollcommand=dt_sb.set,
-            state=tk.DISABLED,
         )
         dt_sb.config(command=dt_txt.yview)
         dt_sb.pack(side=tk.RIGHT, fill=tk.Y)
         dt_txt.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        dt_txt.config(state=tk.NORMAL)
         dt_txt.insert(
             "1.0",
             "\n\n".join(detail_blocks) if detail_blocks else "(noch keine Einträge)",
         )
-        dt_txt.config(state=tk.DISABLED)
+        readonly_copyable_text_finalize(dt_txt, root)
 
-        text_lines = [
-            token_full_text(t)
-            for t in tokens_latest
-            if (t.get("label") or "").strip() == "__text__"
-        ]
         tk.Label(body, text=f"__text__-Tokens letzter Scan ({len(text_lines)})", font=("Segoe UI", 10, "bold")).pack(
             anchor="w", pady=(10, 2)
         )
@@ -824,25 +909,16 @@ def main() -> int:
             wrap=tk.WORD,
             font=("Segoe UI", 9),
             yscrollcommand=tsb.set,
-            state=tk.DISABLED,
         )
         tsb.config(command=ttxt.yview)
         tsb.pack(side=tk.RIGHT, fill=tk.Y)
         ttxt.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        ttxt.config(state=tk.NORMAL)
         ttxt.insert("1.0", "\n".join(text_lines) if text_lines else "(keine __text__-Tokens)")
-        ttxt.config(state=tk.DISABLED)
+        readonly_copyable_text_finalize(ttxt, root)
 
         tk.Label(body, text="Scan-Historie (Kurz)", font=("Segoe UI", 10, "bold")).pack(
             anchor="w", pady=(8, 2)
         )
-        hist_lines: list[str] = []
-        for s in scans:
-            hist_lines.append(
-                f"--- Scan {s['scan_index']} @ {s['created_at']} — "
-                f"Tokens={s['token_count']}, Regionen={s['region_count']} — "
-                f"{len(s['clipboard_raw'])} Zeichen Rohdaten"
-            )
         hf = tk.Frame(body)
         hf.pack(fill=tk.BOTH, expand=True, pady=(0, 4))
         hsb = tk.Scrollbar(hf)
@@ -853,19 +929,16 @@ def main() -> int:
             wrap=tk.WORD,
             font=("Consolas", 9),
             yscrollcommand=hsb.set,
-            state=tk.DISABLED,
         )
         hsb.config(command=htxt.yview)
         hsb.pack(side=tk.RIGHT, fill=tk.Y)
         htxt.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        htxt.config(state=tk.NORMAL)
         htxt.insert(
             "1.0",
             "\n".join(hist_lines) if hist_lines else "(noch keine Scans)",
         )
-        htxt.config(state=tk.DISABLED)
+        readonly_copyable_text_finalize(htxt, root)
 
-        last_raw = scans[-1]["clipboard_raw"] if scans else ""
         tk.Label(body, text="Rohdaten letzter Scan", font=("Segoe UI", 10, "bold")).pack(
             anchor="w", pady=(8, 2)
         )
@@ -879,16 +952,54 @@ def main() -> int:
             wrap=tk.WORD,
             font=("Consolas", 9),
             yscrollcommand=rsb.set,
-            state=tk.DISABLED,
         )
         rsb.config(command=rtx.yview)
         rsb.pack(side=tk.RIGHT, fill=tk.Y)
         rtx.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        rtx.config(state=tk.NORMAL)
         rtx.insert("1.0", last_raw if last_raw.strip() else "(leer)")
-        rtx.config(state=tk.DISABLED)
+        readonly_copyable_text_finalize(rtx, root)
 
-        tk.Button(body, text="Fenster schließen", command=_close_results_only).pack(pady=(10, 4))
+        def copy_everything_to_clipboard() -> None:
+            agg_block = (
+                "\n".join(
+                    f"{'*' if aggregate_by_region[n]['catalog_match'] else '?'} {n}  →  {aggregate_by_region[n]['value']}"
+                    for n in sorted(aggregate_by_region.keys())
+                )
+                or "(noch keine Regionen)"
+            )
+            parts = [
+                "--- Zusammenfassung ---",
+                hdr_text,
+                "",
+                "--- Aggregierte Regionen ---",
+                agg_block,
+                "",
+                "--- Gesamt-Stats-Historie ---",
+                "\n".join(summary_lines) if summary_lines else "(leer)",
+                "",
+                "--- Detail-Historie pro Region ---",
+                "\n\n".join(detail_blocks) if detail_blocks else "(leer)",
+                "",
+                "--- __text__-Tokens letzter Scan ---",
+                "\n".join(text_lines) if text_lines else "(leer)",
+                "",
+                "--- Scan-Historie ---",
+                "\n".join(hist_lines) if hist_lines else "(leer)",
+                "",
+                "--- Rohdaten letzter Scan ---",
+                last_raw if last_raw.strip() else "(leer)",
+            ]
+            blob = "\n".join(parts)
+            root.clipboard_clear()
+            root.clipboard_append(blob)
+            root.update_idletasks()
+
+        btn_bar = tk.Frame(body)
+        btn_bar.pack(fill=tk.X, pady=(10, 4))
+        tk.Button(btn_bar, text="Alles kopieren", command=copy_everything_to_clipboard).pack(
+            side=tk.LEFT, padx=(0, 8)
+        )
+        tk.Button(btn_bar, text="Fenster schließen", command=_close_results_only).pack(side=tk.LEFT)
         results_window.update_idletasks()
         results_window.update()
         results_window.deiconify()
@@ -918,13 +1029,48 @@ def main() -> int:
         _processing_results = True
         current = clipboard_text
         try:
-            scan_no = len(scans) + 1
-            print("[V3] scan detected", flush=True)
-            print(f"[V3] processing scan #{scan_no}", flush=True)
             print("[V3] process_clipboard_and_show started", flush=True)
             print("[V3] clipboard length:", len(current), flush=True)
             tokens = parse_clipboard_to_tokens(current)
             regions, stats = group_tokens_into_regions(tokens)
+            nt_ok, nr_ok = len(tokens), len(regions)
+            print(f"[V3] candidate tokens:{nt_ok} regions:{nr_ok}", flush=True)
+            if not is_valid_pokerth_scan(current, regions):
+                print(
+                    f"[V3] invalid scan ignored: clipboard length={len(current)}, tokens={nt_ok}, regions={nr_ok}",
+                    flush=True,
+                )
+                try:
+                    messagebox.showinfo(
+                        "Tablemap Scanner V3",
+                        "Kein verwertbarer PokerTH-Text erkannt.\n\n"
+                        "Bitte erneut mit dem Snipping Tool kopieren.",
+                        parent=root,
+                    )
+                except tk.TclError:
+                    pass
+                kill_snipping_process(proc)
+                if not _start_snipping():
+                    try:
+                        messagebox.showwarning(
+                            "Tablemap Scanner V3",
+                            "snippingtool.exe konnte nicht neu gestartet werden. "
+                            "Erneuter Clipboard-Empfang ist ggf. eingeschränkt.",
+                            parent=root,
+                        )
+                    except tk.TclError:
+                        pass
+                baseline = _normalize_clip(current)
+                clipboard_text = None
+                polling_active = True
+                print("[V3] waiting for next scan", flush=True)
+                build_state1()
+                root.after(POLL_INTERVAL_MS, on_poll)
+                return
+
+            scan_no = len(scans) + 1
+            print("[V3] scan detected", flush=True)
+            print(f"[V3] processing scan #{scan_no}", flush=True)
             print(f"[V3] scan #{scan_no} tokens:", len(tokens), flush=True)
             print(f"[V3] scan #{scan_no} regions:", len(regions), flush=True)
             ts = datetime.now().isoformat(timespec="seconds")

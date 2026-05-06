@@ -9,10 +9,12 @@ import json
 import re
 import subprocess
 import sys
+import traceback
 from datetime import datetime
 from pathlib import Path
 
 import tkinter as tk
+from tkinter import messagebox
 
 import win32clipboard
 import win32con
@@ -578,9 +580,11 @@ def main() -> int:
         out_path: Path,
         clipboard_raw: str,
     ) -> None:
-        wait_frame.pack_forget()
+        print("[V3] show_results: building GUI", flush=True)
+        # Größe zuerst setzen, damit nach pack_forget kein „kollabiertes“ Fenster entsteht.
         root.geometry("800x780")
         root.minsize(620, 620)
+        wait_frame.pack_forget()
         body = tk.Frame(root)
         body.pack(fill=tk.BOTH, expand=True, padx=10, pady=8)
         hdr = tk.Label(
@@ -660,8 +664,13 @@ def main() -> int:
         tk.Button(body, text="Beenden", command=_shutdown).pack(pady=(10, 4))
         root.update_idletasks()
         root.update()
+        root.deiconify()
         root.lift()
-        root.focus_force()
+        try:
+            root.focus_force()
+        except tk.TclError as exc:
+            print("[V3][WARN] focus_force failed:", repr(exc), flush=True)
+        print("[V3] show_results returned / GUI built", flush=True)
 
     def _clear_wait_inner() -> None:
         for child in wait_inner.winfo_children():
@@ -670,12 +679,23 @@ def main() -> int:
     def process_clipboard_and_show() -> None:
         nonlocal session_done, clipboard_text, _processing_results
         if _processing_results or session_done or not clipboard_text:
+            print(
+                "[V3] process_clipboard_and_show skipped:",
+                f"_processing_results={_processing_results}",
+                f"session_done={session_done}",
+                f"has_clipboard={bool(clipboard_text)}",
+                flush=True,
+            )
             return
         _processing_results = True
         current = clipboard_text
         try:
+            print("[V3] process_clipboard_and_show started", flush=True)
+            print("[V3] clipboard length:", len(clipboard_text or ""), flush=True)
             tokens = parse_clipboard_to_tokens(current)
             regions, stats = group_tokens_into_regions(tokens)
+            print("[V3] tokens:", len(tokens), flush=True)
+            print("[V3] regions:", len(regions), flush=True)
             stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             out_path = out_dir / f"pokerth_tablemap_{stamp}.json"
             payload = {
@@ -690,10 +710,25 @@ def main() -> int:
                 "clipboard_raw": current,
             }
             out_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+            print("[V3] json written:", out_path, flush=True)
 
             kill_snipping_process(proc)
+            print("[V3] calling show_results", flush=True)
             show_results(tokens, regions, stats, out_path, current)
+            print("[V3] show_results finished (after build)", flush=True)
             session_done = True
+        except Exception as exc:
+            print("[V3][ERROR]", repr(exc), flush=True)
+            traceback.print_exc()
+            try:
+                messagebox.showerror(
+                    "Tablemap Scanner V3 — Fehler",
+                    "Beim Verarbeiten ist ein Fehler aufgetreten:\n\n"
+                    f"{exc}\n\nDetails siehe Konsole (Terminal).",
+                    parent=root,
+                )
+            except tk.TclError as tke:
+                print("[V3][ERROR] could not show messagebox:", repr(tke), flush=True)
         finally:
             _processing_results = False
 

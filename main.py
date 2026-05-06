@@ -554,24 +554,11 @@ def main() -> int:
     wait_frame = tk.Frame(root, padx=16, pady=16)
     wait_frame.pack(fill=tk.BOTH, expand=True)
 
-    tk.Label(wait_frame, text="Tablemap Scanner V3", font=("Segoe UI", 11, "bold")).pack(
-        anchor=tk.CENTER, pady=(0, 6)
-    )
-    tk.Label(
-        wait_frame,
-        text="Warte auf Text aus dem Snipping Tool ...",
-        wraplength=460,
-        justify=tk.CENTER,
-    ).pack(anchor=tk.CENTER, pady=(0, 4))
-    tk.Label(
-        wait_frame,
-        text=(
-            "Bitte im Snipping Tool den Bereich markieren und "
-            "„Text aus Bild kopieren“ klicken."
-        ),
-        wraplength=460,
-        justify=tk.CENTER,
-    ).pack(anchor=tk.CENTER, pady=(0, 14))
+    wait_inner = tk.Frame(wait_frame)
+    wait_inner.pack(fill=tk.BOTH, expand=True)
+
+    clipboard_text: str | None = None
+    polling_active = True
 
     def _shutdown() -> None:
         nonlocal session_done, exit_code
@@ -582,12 +569,6 @@ def main() -> int:
         root.destroy()
 
     root.protocol("WM_DELETE_WINDOW", _shutdown)
-
-    tk.Button(
-        wait_frame,
-        text="Scan abbrechen / Beenden",
-        command=_shutdown,
-    ).pack(anchor=tk.CENTER)
 
     def show_results(
         tokens: list[dict],
@@ -677,6 +658,88 @@ def main() -> int:
 
         tk.Button(body, text="Schließen", command=_shutdown).pack(pady=(10, 4))
 
+    def _clear_wait_inner() -> None:
+        for child in wait_inner.winfo_children():
+            child.destroy()
+
+    def process_clipboard_and_show() -> None:
+        nonlocal session_done, clipboard_text
+        if session_done or not clipboard_text:
+            return
+        current = clipboard_text
+        tokens = parse_clipboard_to_tokens(current)
+        regions, stats = group_tokens_into_regions(tokens)
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        out_path = out_dir / f"pokerth_tablemap_{stamp}.json"
+        payload = {
+            "generated_at": datetime.now().isoformat(timespec="seconds"),
+            "screenshot": str(screenshot_path),
+            "token_count": len(tokens),
+            "tokens": tokens,
+            "regions": regions,
+            "region_catalog": list(REGION_CATALOG),
+            "region_count": stats["region_count"],
+            "remaining_text_lines": stats["remaining_text_lines"],
+            "clipboard_raw": current,
+        }
+        out_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+        session_done = True
+        kill_snipping_process(proc)
+        show_results(tokens, regions, stats, out_path, current)
+
+    def build_state1() -> None:
+        _clear_wait_inner()
+        tk.Label(wait_inner, text="Tablemap Scanner V3", font=("Segoe UI", 11, "bold")).pack(
+            anchor=tk.CENTER, pady=(0, 6)
+        )
+        tk.Label(
+            wait_inner,
+            text="Warte auf Text aus dem Snipping Tool ...",
+            wraplength=460,
+            justify=tk.CENTER,
+        ).pack(anchor=tk.CENTER, pady=(0, 4))
+        tk.Label(
+            wait_inner,
+            text=(
+                "Bitte im Snipping Tool den Bereich markieren und "
+                "„Text aus Bild kopieren“ klicken."
+            ),
+            wraplength=460,
+            justify=tk.CENTER,
+        ).pack(anchor=tk.CENTER, pady=(0, 14))
+        tk.Button(
+            wait_inner,
+            text="Scan abbrechen / Beenden",
+            command=_shutdown,
+        ).pack(anchor=tk.CENTER)
+
+    def build_state2() -> None:
+        _clear_wait_inner()
+        tk.Label(wait_inner, text="Tablemap Scanner V3", font=("Segoe UI", 11, "bold")).pack(
+            anchor=tk.CENTER, pady=(0, 6)
+        )
+        tk.Label(
+            wait_inner,
+            text="Text aus dem Snipping Tool wurde erkannt.",
+            wraplength=460,
+            justify=tk.CENTER,
+        ).pack(anchor=tk.CENTER, pady=(0, 4))
+        tk.Label(
+            wait_inner,
+            text="Bitte bestätigen, um die Daten zu verarbeiten.",
+            wraplength=460,
+            justify=tk.CENTER,
+        ).pack(anchor=tk.CENTER, pady=(0, 14))
+        btn_row = tk.Frame(wait_inner)
+        btn_row.pack(anchor=tk.CENTER, pady=(4, 0))
+        tk.Button(btn_row, text="Daten verarbeiten", command=process_clipboard_and_show).pack(
+            side=tk.LEFT, padx=8
+        )
+        tk.Button(btn_row, text="Abbrechen / Beenden", command=_shutdown).pack(side=tk.LEFT, padx=8)
+
+    build_state1()
+
     root.update_idletasks()
     root.update()
 
@@ -684,33 +747,17 @@ def main() -> int:
     baseline = _normalize_clip(baseline_raw)
 
     def on_poll() -> None:
-        nonlocal session_done, exit_code
-        if session_done:
+        nonlocal clipboard_text, polling_active
+        if session_done or not polling_active:
             return
 
         current_raw = _read_clipboard_text()
         current = _normalize_clip(current_raw)
         if current and current != baseline:
-            tokens = parse_clipboard_to_tokens(current)
-            regions, stats = group_tokens_into_regions(tokens)
-            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            out_path = out_dir / f"pokerth_tablemap_{stamp}.json"
-            payload = {
-                "generated_at": datetime.now().isoformat(timespec="seconds"),
-                "screenshot": str(screenshot_path),
-                "token_count": len(tokens),
-                "tokens": tokens,
-                "regions": regions,
-                "region_catalog": list(REGION_CATALOG),
-                "region_count": stats["region_count"],
-                "remaining_text_lines": stats["remaining_text_lines"],
-                "clipboard_raw": current,
-            }
-            out_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-
-            session_done = True
+            clipboard_text = current
+            polling_active = False
             kill_snipping_process(proc)
-            show_results(tokens, regions, stats, out_path, current)
+            build_state2()
             return
 
         root.after(POLL_INTERVAL_MS, on_poll)

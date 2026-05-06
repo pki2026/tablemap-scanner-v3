@@ -3,3 +3,7 @@ __pycache__/
 .venv/
 venv/
 output/*.json
+
+# Nutzer-lokale Anker — nicht committen
+anchors/table_anchor_patch.png
+anchors/table_anchor_config.json

@@ -1,5 +1,6 @@
 """
 Tablemap Scanner V3 — Clipboard-only pipeline via Windows Snipping Tool „Text aus Bild kopieren“.
+Optional: --calibrate-anchor = transparentes Desktop-Overlay zum Setzen des Tabellen-Ankers.
 """
 
 from __future__ import annotations
@@ -16,6 +17,8 @@ from pathlib import Path
 
 import tkinter as tk
 from tkinter import messagebox
+
+from anchor_kit import run_anchor_calibration_blocking
 
 import win32clipboard
 import win32con
@@ -1089,10 +1092,33 @@ def main() -> int:
     parser.add_argument(
         "--screenshot",
         type=Path,
-        required=True,
-        help="Pfad zum Screenshot-Bild für Snipping Tool (/file)",
+        default=None,
+        help="Pfad zum Screenshot-Bild für Snipping Tool (/file); nicht nötig bei --calibrate-anchor.",
+    )
+    parser.add_argument(
+        "--calibrate-anchor",
+        action="store_true",
+        help="Transparentes Desktop-Overlay: Anker setzen und beenden (kein Snipping-Modus).",
     )
     args = parser.parse_args()
+
+    if args.calibrate_anchor:
+        root = tk.Tk()
+        root.withdraw()
+        try:
+            ok = run_anchor_calibration_blocking(root)
+        finally:
+            try:
+                root.destroy()
+            except tk.TclError:
+                pass
+        if not ok:
+            print("[V3] anchor calibration: aborted or failed", flush=True)
+        return 0 if ok else 5
+
+    if args.screenshot is None:
+        parser.error("Das Argument --screenshot ist erforderlich (außer mit --calibrate-anchor).")
+
     screenshot_path = args.screenshot.resolve()
     if not screenshot_path.is_file():
         print(f"Screenshot nicht gefunden: {screenshot_path}", file=sys.stderr)

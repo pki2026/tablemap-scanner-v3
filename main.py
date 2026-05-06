@@ -1103,8 +1103,34 @@ def main() -> int:
     args = parser.parse_args()
 
     if args.calibrate_anchor:
+        print("[V3] overlay: creating root", flush=True)
         root = tk.Tk()
-        root.withdraw()
+        root.title("Tablemap Scanner V3")
+        # Parent darf auf Windows nicht withdrawn sein, sonst kann das Toplevel unsichtbar bleiben.
+        try:
+            root.geometry("1x1+-2500+-2500")
+        except tk.TclError:
+            pass
+        root.attributes("-topmost", True)
+
+        def _on_sigint(_sig: int | None = None, _frame=None) -> None:
+            print("[V3] overlay: SIGINT — beende Tk", flush=True)
+            try:
+                root.quit()
+            except tk.TclError:
+                pass
+            try:
+                root.destroy()
+            except tk.TclError:
+                pass
+
+        try:
+            import signal
+
+            signal.signal(signal.SIGINT, lambda s, f: _on_sigint())
+        except Exception:
+            pass
+
         try:
             ok = run_anchor_calibration_blocking(root)
         finally:

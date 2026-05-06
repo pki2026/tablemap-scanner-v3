@@ -19,7 +19,14 @@ import tkinter as tk
 from tkinter import messagebox
 
 from anchor_kit import ANCHOR_PATCH_PATH, clear_saved_anchor_files, run_anchor_calibration_blocking
-from measure_kit import MeasureError, capture_and_measure_snipping_tool
+from measure_kit import (
+    MeasureError,
+    build_region_boxes,
+    capture_and_measure_snipping_tool,
+    filter_boxes_for_mapping,
+    map_ordered_tokens_to_boxes,
+    save_mapping_debug_image,
+)
 
 import win32clipboard
 import win32con
@@ -355,6 +362,8 @@ def parse_clipboard_to_tokens(text: str) -> list[dict]:
         # Übrige Zeilen als Freitext
         tokens.append(_make_token("__text__", line))
 
+    for i, tok in enumerate(tokens):
+        tok["token_index"] = i
     return tokens
 
 
@@ -722,7 +731,7 @@ def group_tokens_into_regions(tokens: list[dict]) -> tuple[list[dict], dict[str,
     dealer_pending = False
     button_idx = 0
 
-    def emit(region_name: str, value: str) -> bool:
+    def emit(region_name: str, value: str, *, source_token_indices: list[int] | None = None) -> bool:
         if region_name in assigned:
             return False
         assigned.add(region_name)
@@ -731,6 +740,7 @@ def group_tokens_into_regions(tokens: list[dict]) -> tuple[list[dict], dict[str,
                 "region_name": region_name,
                 "value": value,
                 "catalog_match": region_name in REGION_CATALOG_SET,
+                "source_token_indices": list(source_token_indices) if source_token_indices else [],
             }
         )
         return True
@@ -787,13 +797,15 @@ def group_tokens_into_regions(tokens: list[dict]) -> tuple[list[dict], dict[str,
                             seat = _extract_player_seat(ft.strip())
                             if seat is None:
                                 continue
-                            if emit(pname_r, ft.strip()) and emit(pb_r, mx):
+                            if emit(pname_r, ft.strip(), source_token_indices=[i]) and emit(
+                                pb_r, mx, source_token_indices=[j]
+                            ):
                                 print(
                                     f"[V3] player mapped: {prefix}name={ft.strip()}, {prefix}balance={mx}",
                                     flush=True,
                                 )
                                 if dealer_pending:
-                                    ok_dealer = emit(f"p{seat}dealer", "1")
+                                    ok_dealer = emit(f"p{seat}dealer", "1", source_token_indices=[])
                                     print(
                                         f"[tablemap] Dealer → Sitz {seat} (p{seat}dealer), gesetzt={ok_dealer}",
                                         flush=True,
@@ -823,13 +835,15 @@ def group_tokens_into_regions(tokens: list[dict]) -> tuple[list[dict], dict[str,
                     seat = _extract_player_seat(nx)
                     if seat is None:
                         continue
-                    if emit(pname_r, nx) and emit(pb_r, ft):
+                    if emit(pname_r, nx, source_token_indices=[j]) and emit(
+                        pb_r, ft, source_token_indices=[i]
+                    ):
                         print(
                             f"[V3] player mapped: {prefix}name={nx}, {prefix}balance={ft}",
                             flush=True,
                         )
                         if dealer_pending:
-                            ok_dealer = emit(f"p{seat}dealer", "1")
+                            ok_dealer = emit(f"p{seat}dealer", "1", source_token_indices=[])
                             print(
                                 f"[tablemap] Dealer → Sitz {seat} (p{seat}dealer), gesetzt={ok_dealer}",
                                 flush=True,
@@ -847,7 +861,7 @@ def group_tokens_into_regions(tokens: list[dict]) -> tuple[list[dict], dict[str,
             single_blind = _blind_region_from_single_line(ft)
             if single_blind:
                 rn, val = single_blind
-                emit(rn, val)
+                emit(rn, val, source_token_indices=[i])
                 consumed.add(i)
                 i += 1
                 continue
@@ -855,7 +869,7 @@ def group_tokens_into_regions(tokens: list[dict]) -> tuple[list[dict], dict[str,
         tb = _total_bets_single_token(t)
         if tb:
             rn, val = tb
-            emit(rn, val)
+            emit(rn, val, source_token_indices=[i])
             consumed.add(i)
             i += 1
             continue
@@ -863,7 +877,7 @@ def group_tokens_into_regions(tokens: list[dict]) -> tuple[list[dict], dict[str,
         gh = _game_hand_match(t)
         if gh:
             rn, val = gh
-            emit(rn, val)
+            emit(rn, val, source_token_indices=[i])
             consumed.add(i)
             i += 1
             continue
@@ -886,7 +900,7 @@ def group_tokens_into_regions(tokens: list[dict]) -> tuple[list[dict], dict[str,
                     dbg_skip_btn += 1
                 i += 1
                 continue
-            emit(f"i{button_idx}label", btn_lab)
+            emit(f"i{button_idx}label", btn_lab, source_token_indices=[i])
             button_idx += 1
             consumed.add(i)
             i += 1
@@ -895,7 +909,8 @@ def group_tokens_into_regions(tokens: list[dict]) -> tuple[list[dict], dict[str,
         br = _try_resolve_blind(tokens, ft_list, i, consumed, n, in_log_zone)
         if br:
             rn, val, header_idxs, money_j = br
-            ok = emit(rn, val)
+            _src = sorted(set(header_idxs + ([money_j] if money_j is not None else [])))
+            ok = emit(rn, val, source_token_indices=_src)
             consumed.update(header_idxs)
             if ok and money_j is not None:
                 consumed.add(money_j)
@@ -905,12 +920,12 @@ def group_tokens_into_regions(tokens: list[dict]) -> tuple[list[dict], dict[str,
         if i + 1 < n and _money_value_follows(tokens[i + 1]) and "$" not in ft:
             nxt_val = _currency_display(tokens[i + 1])
             if _total_header_pair(ft_low):
-                emit("c0pot_total", nxt_val)
+                emit("c0pot_total", nxt_val, source_token_indices=[i, i + 1])
                 consumed.update((i, i + 1))
                 i += 2
                 continue
             if _bets_header_pair(ft_low):
-                emit("c0pot_bets", nxt_val)
+                emit("c0pot_bets", nxt_val, source_token_indices=[i, i + 1])
                 consumed.update((i, i + 1))
                 i += 2
                 continue
@@ -1341,14 +1356,19 @@ def main() -> int:
         out_path = out_dir / f"pokerth_tablemap_aggregate_{stamp}.json"
         order = sorted_region_names(aggregate_by_region.keys())
         regions_flat = {name: aggregate_by_region[name]["value"] for name in order}
-        regions_detail = [
-            {
+        last_regions_by_name = {r["region_name"]: r for r in (scans[-1].get("regions") or [])}
+        regions_detail: list[dict] = []
+        for name in order:
+            row = {
                 "region_name": name,
                 "value": aggregate_by_region[name]["value"],
                 "catalog_match": aggregate_by_region[name]["catalog_match"],
             }
-            for name in order
-        ]
+            lr = last_regions_by_name.get(name)
+            row["source_token_indices"] = (
+                list(lr.get("source_token_indices", [])) if lr else []
+            )
+            regions_detail.append(row)
         region_summary = compute_region_summary(region_history, aggregate_by_region)
         rh_order = sorted_region_names(region_history.keys())
         region_history_ordered = {name: region_history[name] for name in rh_order}
@@ -1373,6 +1393,8 @@ def main() -> int:
         payload["marked_capture_latest"] = last_scan.get("marked_capture")
         payload["anchor_latest"] = last_scan.get("anchor")
         payload["snipping_text_boxes_latest"] = last_scan.get("snipping_text_boxes")
+        payload["region_boxes_latest"] = last_scan.get("region_boxes")
+        payload["token_box_map_latest"] = last_scan.get("token_box_map")
         out_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
         print("[V3] final export written:", out_path, flush=True)
 
@@ -1459,6 +1481,26 @@ def main() -> int:
                 f"{len(s['clipboard_raw'])} Zeichen Rohdaten"
             )
         last_raw = scans[-1]["clipboard_raw"] if scans else ""
+
+        rb_ok: list[str] = []
+        rb_unmatched_regions: list[str] = []
+        ub_lines: list[str] = []
+        if scans:
+            ls0 = scans[-1]
+            for rb in ls0.get("region_boxes") or []:
+                if rb.get("geometry_status") == "matched":
+                    rel = rb.get("rel") or {}
+                    rb_ok.append(
+                        f"{rb['region_name']} → {rb['value']} → box {rb['box_index']} → "
+                        f"rel=({rel.get('x1')},{rel.get('y1')})-({rel.get('x2')},{rel.get('y2')})"
+                    )
+                else:
+                    rb_unmatched_regions.append(
+                        f"{rb['region_name']} → {rb['value']} "
+                        f"(tokens {rb.get('source_token_indices')})"
+                    )
+            for bi in ls0.get("unmatched_boxes") or []:
+                ub_lines.append(f"box_index {bi}")
 
         _meas_note = ""
         if scans:
@@ -1567,6 +1609,72 @@ def main() -> int:
         )
         readonly_copyable_text_finalize(dt_txt, root)
 
+        tk.Label(body, text="Region-Box-Zuordnung (letzter Scan)", font=("Segoe UI", 10, "bold")).pack(
+            anchor="w", pady=(10, 2)
+        )
+        rbf = tk.Frame(body)
+        rbf.pack(fill=tk.BOTH, expand=False, pady=(0, 4))
+        rsbx = tk.Scrollbar(rbf)
+        rb_txt = tk.Text(
+            rbf,
+            height=6,
+            width=96,
+            wrap=tk.WORD,
+            font=("Consolas", 9),
+            yscrollcommand=rsbx.set,
+        )
+        rsbx.config(command=rb_txt.yview)
+        rsbx.pack(side=tk.RIGHT, fill=tk.Y)
+        rb_txt.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        rb_txt.insert(
+            "1.0",
+            "\n".join(rb_ok) if rb_ok else "(keine gematchten Region-Boxen)",
+        )
+        readonly_copyable_text_finalize(rb_txt, root)
+
+        tk.Label(body, text="Nicht zugeordnete Regionen", font=("Segoe UI", 10, "bold")).pack(
+            anchor="w", pady=(4, 2)
+        )
+        urf = tk.Frame(body)
+        urf.pack(fill=tk.BOTH, expand=False, pady=(0, 2))
+        ursb = tk.Scrollbar(urf)
+        ur_txt = tk.Text(
+            urf,
+            height=4,
+            width=96,
+            wrap=tk.WORD,
+            font=("Consolas", 9),
+            yscrollcommand=ursb.set,
+        )
+        ursb.config(command=ur_txt.yview)
+        ursb.pack(side=tk.RIGHT, fill=tk.Y)
+        ur_txt.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        ur_txt.insert(
+            "1.0",
+            "\n".join(rb_unmatched_regions) if rb_unmatched_regions else "(keine)",
+        )
+        readonly_copyable_text_finalize(ur_txt, root)
+
+        tk.Label(body, text="Nicht zugeordnete Boxen", font=("Segoe UI", 10, "bold")).pack(
+            anchor="w", pady=(4, 2)
+        )
+        uboxf = tk.Frame(body)
+        uboxf.pack(fill=tk.BOTH, expand=False, pady=(0, 4))
+        ubsb = tk.Scrollbar(uboxf)
+        ubox_txt = tk.Text(
+            uboxf,
+            height=3,
+            width=96,
+            wrap=tk.WORD,
+            font=("Consolas", 9),
+            yscrollcommand=ubsb.set,
+        )
+        ubsb.config(command=ubox_txt.yview)
+        ubsb.pack(side=tk.RIGHT, fill=tk.Y)
+        ubox_txt.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        ubox_txt.insert("1.0", "\n".join(ub_lines) if ub_lines else "(keine)")
+        readonly_copyable_text_finalize(ubox_txt, root)
+
         tk.Label(body, text=f"__text__-Tokens letzter Scan ({len(text_lines)})", font=("Segoe UI", 10, "bold")).pack(
             anchor="w", pady=(10, 2)
         )
@@ -1650,6 +1758,15 @@ def main() -> int:
                 "",
                 "--- Detail-Historie pro Region ---",
                 "\n\n".join(detail_blocks) if detail_blocks else "(leer)",
+                "",
+                "--- Region-Box-Zuordnung ---",
+                "\n".join(rb_ok) if rb_ok else "(keine gematchten)",
+                "",
+                "--- Nicht zugeordnete Regionen ---",
+                "\n".join(rb_unmatched_regions) if rb_unmatched_regions else "(keine)",
+                "",
+                "--- Nicht zugeordnete Boxen ---",
+                "\n".join(ub_lines) if ub_lines else "(keine)",
                 "",
                 "--- __text__-Tokens letzter Scan ---",
                 "\n".join(text_lines) if text_lines else "(leer)",
@@ -1794,6 +1911,39 @@ def main() -> int:
             tokens_latest = tokens
             stats_latest = dict(stats)
             geom = pending_geometry
+            img_w = int(geom["marked_capture"]["width"])
+            img_h = int(geom["marked_capture"]["height"])
+            usable_boxes, ignored_boxes = filter_boxes_for_mapping(
+                geom["snipping_text_boxes"], img_w, img_h
+            )
+            map_bundle = map_ordered_tokens_to_boxes(tokens, usable_boxes)
+            boxes_by_index = {int(b["box_index"]): b for b in geom["snipping_text_boxes"]}
+            region_boxes = build_region_boxes(regions, map_bundle, boxes_by_index)
+            repo_root = Path(__file__).resolve().parent
+            dbg_p = save_mapping_debug_image(
+                Path(geom["marked_capture"]["path"]),
+                geom["snipping_text_boxes"],
+                region_boxes,
+                repo_root,
+            )
+            if dbg_p is not None:
+                print(f"[V3] mapping debug: {dbg_p}", flush=True)
+            n_matched = sum(1 for rb in region_boxes if rb.get("geometry_status") == "matched")
+            print(
+                f"[V3] measure map: confidence={map_bundle['mapping_confidence']} "
+                f"boxes_total={len(geom['snipping_text_boxes'])} usable={len(usable_boxes)} "
+                f"ignored={len(ignored_boxes)} region_boxes_matched={n_matched}",
+                flush=True,
+            )
+            regions_snapshot = [
+                {
+                    "region_name": x["region_name"],
+                    "value": x["value"],
+                    "catalog_match": x["catalog_match"],
+                    "source_token_indices": list(x.get("source_token_indices") or []),
+                }
+                for x in regions
+            ]
             scans.append(
                 {
                     "scan_index": scan_no,
@@ -1804,6 +1954,14 @@ def main() -> int:
                     "marked_capture": geom["marked_capture"],
                     "anchor": geom["anchor"],
                     "snipping_text_boxes": geom["snipping_text_boxes"],
+                    "ignored_snipping_boxes": ignored_boxes,
+                    "token_box_map": map_bundle["token_box_map"],
+                    "mapping_confidence": map_bundle["mapping_confidence"],
+                    "unmatched_tokens": map_bundle["unmatched_tokens"],
+                    "unmatched_boxes": map_bundle["unmatched_boxes"],
+                    "region_boxes": region_boxes,
+                    "regions": regions_snapshot,
+                    "mapping_debug_image": str(dbg_p.resolve()) if dbg_p else None,
                 }
             )
             pending_geometry = None

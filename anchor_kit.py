@@ -23,9 +23,13 @@ ANCHOR_CONFIG_PATH = ANCHORS_DIR / "table_anchor_config.json"
 ANCHOR_SCHEMA = "tablemap_scanner_v3_anchor"
 
 
-def saved_anchor_files_present() -> bool:
-    """True, wenn Kalibrierung abgeschlossen (Patch + Config auf der Platte)."""
-    return ANCHOR_PATCH_PATH.is_file() and ANCHOR_CONFIG_PATH.is_file()
+def clear_saved_anchor_files() -> None:
+    """Alte Anker-Dateien entfernen (Normalstart legt den Anker neu an)."""
+    for p in (ANCHOR_PATCH_PATH, ANCHOR_CONFIG_PATH):
+        try:
+            p.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def _safe_grab_release(w: tk.Misc) -> None:

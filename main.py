@@ -1,7 +1,6 @@
 """
 Tablemap Scanner V3 — Clipboard-only pipeline via Windows Snipping Tool „Text aus Bild kopieren“.
-Normalstart erfordert gespeicherten Anker (anchors/…); optional: --calibrate-anchor zum Setzen.
-"""
+Normalstart: zuerst Anker-Kalibrierung am Screenshot, dann Snipping; --calibrate-anchor nur Kalibrieren.
 
 from __future__ import annotations
 
@@ -18,7 +17,7 @@ from pathlib import Path
 import tkinter as tk
 from tkinter import messagebox
 
-from anchor_kit import run_anchor_calibration_blocking, saved_anchor_files_present
+from anchor_kit import clear_saved_anchor_files, run_anchor_calibration_blocking
 
 import win32clipboard
 import win32con
@@ -1094,8 +1093,8 @@ def main() -> int:
         type=Path,
         default=None,
         help=(
-            "Pfad zur Bilddatei. Mit --calibrate-anchor: Referenz-Screenshot für die Kalibrierung. "
-            "Ohne --calibrate-anchor: Zieldatei für Snipping Tool (/file)."
+            "Pfad zur Bilddatei. Normalstart: gleiches Bild für Kalibrierung und später Snipping (/file). "
+            "Mit --calibrate-anchor: nur Kalibrierung, Programmende nach Speichern."
         ),
     )
     parser.add_argument(
@@ -1184,23 +1183,73 @@ def main() -> int:
         print(f"Screenshot nicht gefunden: {screenshot_path}", file=sys.stderr)
         return 2
 
-    if not saved_anchor_files_present():
-        hint = (
-            "Kein Anker vorhanden. Bitte zuerst Anker setzen mit:\n"
-            'python main.py --calibrate-anchor --screenshot "<PFAD>"'
-        )
-        print(hint, file=sys.stderr, flush=True)
-        root_hint = tk.Tk()
-        root_hint.withdraw()
+    clear_saved_anchor_files()
+    print("[V3] normal start: opening anchor calibration before scan", flush=True)
+
+    root = tk.Tk()
+    root.title("Tablemap Scanner V3")
+    root.geometry("360x108")
+    root.deiconify()
+    root.attributes("-topmost", True)
+    root.lift()
+    tk.Label(
+        root,
+        text=(
+            "Anker-Kalibrierung\n"
+            '(Bitte das Fenster „Tablemap Scanner V3 — Anker setzen“ verwenden.)'
+        ),
+        justify=tk.CENTER,
+        padx=12,
+        pady=14,
+    ).pack(fill=tk.BOTH, expand=True)
+    root.update_idletasks()
+    root.update()
+    try:
+        root.focus_force()
+    except Exception:
+        pass
+
+    def _unset_topmost_pre_scan() -> None:
         try:
-            messagebox.showwarning("Tablemap Scanner V3", hint, parent=root_hint)
+            root.attributes("-topmost", False)
+        except tk.TclError:
+            pass
+
+    root.after(500, _unset_topmost_pre_scan)
+
+    try:
+        ok = run_anchor_calibration_blocking(root, screenshot_path)
+    except Exception as exc:
+        traceback.print_exc()
+        print(f"[V3][ERROR] anchor calibration failed: {exc}", flush=True)
+        try:
+            messagebox.showerror(
+                "Anker kalibrieren",
+                f"Kalibrierung fehlgeschlagen:\n{exc}\n\nDetails siehe Terminal.",
+                parent=root,
+            )
         except tk.TclError:
             pass
         try:
-            root_hint.destroy()
+            root.destroy()
         except tk.TclError:
             pass
-        return 6
+        return 4
+
+    if not ok:
+        print("[V3] anchor calibration: aborted or failed — exiting without scan", flush=True)
+        try:
+            root.destroy()
+        except tk.TclError:
+            pass
+        return 5
+
+    for w in root.winfo_children():
+        w.destroy()
+    root.title("Tablemap Scanner V3")
+    root.geometry("600x340")
+    root.minsize(520, 300)
+    root.attributes("-topmost", True)
 
     out_dir = Path(__file__).resolve().parent / "output"
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -1220,13 +1269,11 @@ def main() -> int:
             "snippingtool.exe nicht gefunden (PATH / Windows-Komponente).",
             file=sys.stderr,
         )
+        try:
+            root.destroy()
+        except tk.TclError:
+            pass
         return 3
-
-    root = tk.Tk()
-    root.title("Tablemap Scanner V3")
-    root.geometry("600x340")
-    root.minsize(520, 300)
-    root.attributes("-topmost", True)
 
     wait_frame = tk.Frame(root, padx=16, pady=16)
     wait_frame.pack(fill=tk.BOTH, expand=True)
@@ -1788,7 +1835,7 @@ def main() -> int:
         )
         tk.Label(
             wait_inner,
-            text="Anker: vorhanden",
+            text="Anker: neu gesetzt",
             fg="#206020",
             wraplength=520,
             justify=tk.CENTER,
@@ -1836,7 +1883,7 @@ def main() -> int:
         )
         tk.Label(
             wait_inner,
-            text="Anker: vorhanden",
+            text="Anker: neu gesetzt",
             fg="#206020",
             wraplength=520,
             justify=tk.CENTER,

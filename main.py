@@ -1,6 +1,7 @@
 """
 Tablemap Scanner V3 — Clipboard-only pipeline via Windows Snipping Tool „Text aus Bild kopieren“.
 Normalstart: zuerst Anker-Kalibrierung am Screenshot, dann Snipping; --calibrate-anchor nur Kalibrieren.
+"""
 
 from __future__ import annotations
 

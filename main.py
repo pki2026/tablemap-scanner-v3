@@ -364,6 +364,13 @@ def token_full_text(t: dict) -> str:
     return lab or val
 
 
+def _grouping_plaintext(t: dict) -> str:
+    """Volltext für Heuristiken (Geldtokens nur als reines $-Literal, ohne __money__-Präfix)."""
+    if (t.get("label") or "").strip() == "__money__":
+        return _currency_display(t).strip()
+    return token_full_text(t).strip()
+
+
 def _currency_display(t: dict) -> str:
     """Reinen Geldbetrag aus Parser-Tokens (__money__ + Betrag)."""
     lab = (t.get("label") or "").strip()
@@ -380,22 +387,161 @@ def _money_value_follows(t: dict) -> bool:
     return token_full_text(t).strip().startswith("$")
 
 
-def _extract_player_seat(full: str) -> int | None:
-    low = full.lower().strip()
-    if low.startswith("human player"):
-        return 0
-    m = re.search(r"player\s+(\d+)", low, re.IGNORECASE)
-    if not m:
-        return None
-    n = int(m.group(1))
-    if 1 <= n <= 10:
-        return n - 1
+_PLAYER_NAME_ALLOWED = frozenset(
+    {"human player"} | {f"player {i}" for i in range(1, 10)},
+)
+
+_LOG_LINE_COMMENT_RE = re.compile(
+    r"(?ims)^[^\n]*(---\s*flop\s*---|---\s*turn\s*---|---\s*river\s*---|##\s*game\s*:)"
+)
+
+
+def player_region_prefix(name: str) -> str | None:
+    low = name.strip().lower()
+    if low == "human player":
+        return "p0"
+    if m := re.fullmatch(r"player\s+([1-9])", low):
+        return f"p{m.group(1)}"
     return None
 
 
-def _is_player_header_token(t: dict) -> bool:
-    low = token_full_text(t).strip().lower()
-    return low.startswith("player") or low.startswith("human player")
+def is_player_name_text(text: str) -> bool:
+    return text.strip().lower() in _PLAYER_NAME_ALLOWED
+
+
+def money_to_number(text: str) -> float:
+    s = text.strip()
+    if not s.startswith("$"):
+        return -1.0
+    body = s[1:].strip().replace(" ", "")
+    if not body or not re.fullmatch(r"\d[\d]*(?:[.,]\d[\d]*)*", body):
+        return -1.0
+    dot_cnt = body.count(".")
+    comma_cnt = body.count(",")
+
+    if dot_cnt >= 1 and comma_cnt == 0:
+        if re.fullmatch(r"\d{1,3}(?:\.\d{3})+", body):
+            return float(body.replace(".", ""))
+        try:
+            return float(body.replace(",", "."))
+        except ValueError:
+            return -1.0
+    if comma_cnt >= 1 and dot_cnt == 0:
+        if re.fullmatch(r"\d{1,3}(?:,\d{3})+", body):
+            return float(body.replace(",", ""))
+        if re.fullmatch(r"\d+,\d{1,2}$", body):
+            return float(body.replace(",", "."))
+        return -1.0
+    if dot_cnt >= 1 and comma_cnt >= 1 and re.fullmatch(r"\d{1,3}(?:\.\d{3})+,\d{1,2}$", body):
+        return float(body.replace(".", "").replace(",", "."))
+
+    collapsed = body.replace(",", "")
+    try:
+        return float(collapsed)
+    except ValueError:
+        return -1.0
+
+
+def is_money_only(text: str) -> bool:
+    return bool(re.fullmatch(r"\$\d+(?:[.,]\d+)*", text.strip()))
+
+
+def is_plausible_blind_amount(text: str) -> bool:
+    if not is_money_only(text):
+        return False
+    n = money_to_number(text)
+    return 0 < n < 1000
+
+
+def _starts_log_section(ft: str) -> bool:
+    low = ft.strip().lower()
+    if low == "log":
+        return True
+    if low.startswith("## game"):
+        return True
+    return bool(re.match(r"^---\s*flop\s*---|^---\s*turn\s*---|^---\s*river\s*---", low))
+
+
+def is_log_line(text: str) -> bool:
+    raw = text.strip()
+    if not raw:
+        return False
+    low = raw.lower()
+
+    if _starts_log_section(raw):
+        return True
+
+    if _LOG_LINE_COMMENT_RE.match(raw.strip()):
+        return True
+
+    if re.search(r"(?i)\bhas\s+\[", raw):
+        return True
+    if re.search(r"(?i)\bsits\s+out\b", raw):
+        return True
+
+    if re.match(
+        r"(?is)^human\s+player\s+(calls|checks|bets|folds|raises|posts|shows|ties|stands|mucks)\b.*",
+        raw,
+    ):
+        return True
+    if re.match(r"(?is)^human\s+player\s+wins\b", raw):
+        return True
+
+    if re.match(
+        r"(?is)^player\s+\d+\s+(calls|checks|bets|folds|raises|posts|shows|ties|stands|mucks)\b.*",
+        raw,
+    ):
+        return True
+    if re.match(r"(?is)^player\s+\d+\s+wins\b", raw):
+        return True
+    return False
+
+
+def is_pure_button_label_text(t: dict, ft: str) -> bool:
+    ft_s = ft.strip()
+    low = ft_s.lower().rstrip(".!?")
+    if not low or "$" in ft_s:
+        return False
+    val = (t.get("value") or "").strip()
+    if val.startswith("$"):
+        return False
+
+    words = ft_s.strip().split()
+    if len(words) == 1:
+        wl = words[0].lower().rstrip(".!?")
+        return wl.replace("-", "") in {w.replace("-", "") for w in ACTION_WORDS}
+    if (
+        len(words) == 2
+        and words[0].lower() == "all"
+        and words[1].lower().rstrip(".!?") == "in"
+    ):
+        return True
+
+    lab = (t.get("label") or "").strip()
+    if lab and lab != "__text__" and not val:
+        wl = lab.lower().rstrip(".!?")
+        if wl.replace("-", "") in {w.replace("-", "") for w in ACTION_WORDS}:
+            return True
+    return False
+
+
+def _indices_clear_for_player_map(ft_list: list[str], in_log_zone: list[bool], ia: int, ib: int) -> bool:
+    lo, hi = (ia, ib) if ia <= ib else (ib, ia)
+    for k in range(lo, hi + 1):
+        if k < 0 or k >= len(ft_list):
+            return False
+        if in_log_zone[k]:
+            return False
+        if is_log_line(ft_list[k]):
+            return False
+    return True
+
+
+def _extract_player_seat(full: str) -> int | None:
+    prefix = player_region_prefix(full.strip())
+    if prefix is None:
+        return None
+    return int(prefix.removeprefix("p"))
 
 
 def _small_blind_header(ft_low: str) -> bool:
@@ -466,64 +612,99 @@ def _button_display_label(t: dict) -> str | None:
 
 
 def _blind_region_from_single_line(ft: str) -> tuple[str, str] | None:
-    low = ft.lower()
-    if ("small blind" in low or low.startswith("small blind")) and "$" in ft:
-        return ("c0smallblind", ft.strip())
-    if ("big blind" in low or low.startswith("big blind")) and "$" in ft:
-        return ("c0bigblind", ft.strip())
-    return None
+    low = ft.strip().lower()
+    if _small_blind_header(low):
+        rn, hdr = "c0smallblind", "SMALL BLIND"
+    elif _big_blind_header(low):
+        rn, hdr = "c0bigblind", "BIG BLIND"
+    else:
+        return None
+
+    if "$" not in ft:
+        return None
+
+    amt = ""
+    for m in re.finditer(r"\$\d+(?:[.,]\d+)*", ft):
+        cand = m.group(0)
+        if is_plausible_blind_amount(cand):
+            amt = cand
+        else:
+            print(f"[V3] skipped implausible blind amount: {cand}", flush=True)
+
+    return (rn, hdr) if not amt else (rn, f"{hdr} {amt}".strip())
 
 
-def _find_next_unclaimed_money(tokens: list[dict], start: int, consumed: set[int], n: int) -> int | None:
-    """Nächster Token-Index mit Geldbetrag, der noch keiner Region zugeordnet ist."""
+def _find_next_plausible_blind_money(
+    tokens: list[dict],
+    ft_list: list[str],
+    start: int,
+    consumed: set[int],
+    n: int,
+    in_log_zone: list[bool],
+) -> int | None:
     for j in range(start, n):
         if j in consumed:
             continue
-        if _money_value_follows(tokens[j]):
+        if in_log_zone[j]:
+            continue
+        if not _money_value_follows(tokens[j]):
+            continue
+        cur = ft_list[j].strip()
+        if not is_money_only(cur):
+            cur = _currency_display(tokens[j]).strip()
+            if not is_money_only(cur):
+                continue
+        if is_plausible_blind_amount(cur):
             return j
+        print(f"[V3] skipped implausible blind amount: {cur}", flush=True)
     return None
 
 
-def _try_resolve_blind(tokens: list[dict], i: int, consumed: set[int], n: int) -> tuple[str, str, list[int], int | None] | None:
+def _try_resolve_blind(
+    tokens: list[dict],
+    ft_list: list[str],
+    i: int,
+    consumed: set[int],
+    n: int,
+    in_log_zone: list[bool],
+) -> tuple[str, str, list[int], int | None] | None:
     """SMALL BLIND / BIG BLIND auch über zwei Zeilen; `$`-Betrag per Vorwärtssuche (nicht nur direkt folgend)."""
     if i in consumed:
+        return None
+    if in_log_zone[i]:
         return None
     t0 = tokens[i]
     ft0 = token_full_text(t0).strip()
     ft0_low = ft0.lower()
     kind: str | None = None
     end = i
-    hdr: str | None = None
 
     if i + 1 < n and (i + 1) not in consumed:
         ft1_low = token_full_text(tokens[i + 1]).strip().lower()
         if ft0_low == "small" and ft1_low == "blind":
             kind = "small"
             end = i + 2
-            hdr = "SMALL BLIND"
         elif ft0_low == "big" and ft1_low == "blind":
             kind = "big"
             end = i + 2
-            hdr = "BIG BLIND"
 
     if kind is None and "$" not in ft0:
         if _small_blind_header(ft0_low):
             kind = "small"
             end = i + 1
-            hdr = ft0.strip()
         elif _big_blind_header(ft0_low):
             kind = "big"
             end = i + 1
-            hdr = ft0.strip()
 
     if kind is None:
         return None
 
+    hdr = "SMALL BLIND" if kind == "small" else "BIG BLIND"
     rn = "c0smallblind" if kind == "small" else "c0bigblind"
-    money_j = _find_next_unclaimed_money(tokens, end, consumed, n)
+    money_j = _find_next_plausible_blind_money(tokens, ft_list, end, consumed, n, in_log_zone)
     header_idxs = list(range(i, end))
     if money_j is not None:
-        val = f"{hdr} {_currency_display(tokens[money_j])}".strip()
+        val = f"{hdr} {ft_list[money_j].strip()}".strip()
     else:
         val = hdr
     return (rn, val, header_idxs, money_j)
@@ -551,6 +732,19 @@ def group_tokens_into_regions(tokens: list[dict]) -> tuple[list[dict], dict[str,
         return True
 
     n = len(tokens)
+    ft_list = [_grouping_plaintext(tokens[ii]) for ii in range(n)]
+
+    in_log_now = False
+    in_log_zone: list[bool] = []
+    for ii in range(n):
+        in_log_zone.append(in_log_now)
+        if _starts_log_section(ft_list[ii]):
+            in_log_now = True
+
+    print("[V3] player/log guard active", flush=True)
+    dbg_skip_pl = 0
+    dbg_skip_btn = 0
+
     i = 0
     while i < n:
         if i in consumed:
@@ -558,16 +752,101 @@ def group_tokens_into_regions(tokens: list[dict]) -> tuple[list[dict], dict[str,
             continue
 
         t = tokens[i]
-        ft = token_full_text(t)
+        ft = ft_list[i]
         ft_low = ft.strip().lower()
 
-        single_blind = _blind_region_from_single_line(ft)
-        if single_blind:
-            rn, val = single_blind
-            emit(rn, val)
-            consumed.add(i)
-            i += 1
+        if (
+            dbg_skip_pl < 30
+            and is_log_line(ft)
+            and re.match(r"(?is)^(player\s+[1-9]\b|human\s+player)\s+\S", ft)
+        ):
+            snip = ft[:120] + ("..." if len(ft) > 120 else "")
+            print(f"[V3] skipped log line for player mapping: {snip}", flush=True)
+            dbg_skip_pl += 1
+
+        paired = False
+        if not in_log_zone[i]:
+            if is_player_name_text(ft) and not is_log_line(ft):
+                prefix = player_region_prefix(ft.strip())
+                if prefix:
+                    pname_r, pb_r = f"{prefix}name", f"{prefix}balance"
+                    if pname_r not in assigned and pb_r not in assigned:
+                        for delta in (1, 2, 3):
+                            j = i + delta
+                            if j >= n or j in consumed:
+                                continue
+                            mx = ft_list[j].strip()
+                            if not is_money_only(mx) or is_log_line(mx):
+                                continue
+                            if not _indices_clear_for_player_map(ft_list, in_log_zone, i, j):
+                                continue
+                            seat = _extract_player_seat(ft.strip())
+                            if seat is None:
+                                continue
+                            if emit(pname_r, ft.strip()) and emit(pb_r, mx):
+                                print(
+                                    f"[V3] player mapped: {prefix}name={ft.strip()}, {prefix}balance={mx}",
+                                    flush=True,
+                                )
+                                if dealer_pending:
+                                    ok_dealer = emit(f"p{seat}dealer", "1")
+                                    print(
+                                        f"[tablemap] Dealer → Sitz {seat} (p{seat}dealer), gesetzt={ok_dealer}",
+                                        flush=True,
+                                    )
+                                    dealer_pending = False
+                                consumed.update((i, j))
+                                i = j + 1
+                                paired = True
+                                break
+
+            if not paired and is_money_only(ft) and not is_log_line(ft):
+                for delta in (1, 2, 3):
+                    j = i + delta
+                    if j >= n or j in consumed:
+                        continue
+                    nx = ft_list[j].strip()
+                    if not is_player_name_text(nx) or is_log_line(nx):
+                        continue
+                    if not _indices_clear_for_player_map(ft_list, in_log_zone, i, j):
+                        continue
+                    prefix = player_region_prefix(nx)
+                    if not prefix:
+                        continue
+                    pname_r, pb_r = f"{prefix}name", f"{prefix}balance"
+                    if pname_r in assigned or pb_r in assigned:
+                        continue
+                    seat = _extract_player_seat(nx)
+                    if seat is None:
+                        continue
+                    if emit(pname_r, nx) and emit(pb_r, ft):
+                        print(
+                            f"[V3] player mapped: {prefix}name={nx}, {prefix}balance={ft}",
+                            flush=True,
+                        )
+                        if dealer_pending:
+                            ok_dealer = emit(f"p{seat}dealer", "1")
+                            print(
+                                f"[tablemap] Dealer → Sitz {seat} (p{seat}dealer), gesetzt={ok_dealer}",
+                                flush=True,
+                            )
+                            dealer_pending = False
+                        consumed.update((i, j))
+                        i = j + 1
+                        paired = True
+                        break
+
+        if paired:
             continue
+
+        if not in_log_zone[i]:
+            single_blind = _blind_region_from_single_line(ft)
+            if single_blind:
+                rn, val = single_blind
+                emit(rn, val)
+                consumed.add(i)
+                i += 1
+                continue
 
         tb = _total_bets_single_token(t)
         if tb:
@@ -586,38 +865,30 @@ def group_tokens_into_regions(tokens: list[dict]) -> tuple[list[dict], dict[str,
             continue
 
         if _is_dealer_token(t):
-            dealer_pending = True
-            print("[tablemap] DEALER erkannt; Zuordnung beim nächsten Spieler-Paar (pXdealer).", flush=True)
+            if not in_log_zone[i]:
+                dealer_pending = True
+                print("[tablemap] DEALER erkannt; Zuordnung beim nächsten Spieler-Paar (pXdealer).", flush=True)
             consumed.add(i)
             i += 1
             continue
 
         btn_lab = _button_display_label(t)
         if btn_lab is not None:
+            skip_btn = in_log_zone[i] or is_log_line(ft) or not is_pure_button_label_text(t, ft)
+            if skip_btn:
+                if dbg_skip_btn < 28 and (in_log_zone[i] or is_log_line(ft)):
+                    snip = ft[:120] + ("..." if len(ft) > 120 else "")
+                    print(f"[V3] skipped log line for button mapping: {snip}", flush=True)
+                    dbg_skip_btn += 1
+                i += 1
+                continue
             emit(f"i{button_idx}label", btn_lab)
             button_idx += 1
             consumed.add(i)
             i += 1
             continue
 
-        if _is_player_header_token(t) and i + 1 < n and _money_value_follows(tokens[i + 1]):
-            seat = _extract_player_seat(ft)
-            if seat is not None:
-                stack_txt = _currency_display(tokens[i + 1])
-                emit(f"p{seat}name", ft.strip())
-                emit(f"p{seat}balance", stack_txt)
-                if dealer_pending:
-                    ok_dealer = emit(f"p{seat}dealer", "1")
-                    print(
-                        f"[tablemap] Dealer → Sitz {seat} (p{seat}dealer), gesetzt={ok_dealer}",
-                        flush=True,
-                    )
-                    dealer_pending = False
-                consumed.update((i, i + 1))
-                i += 2
-                continue
-
-        br = _try_resolve_blind(tokens, i, consumed, n)
+        br = _try_resolve_blind(tokens, ft_list, i, consumed, n, in_log_zone)
         if br:
             rn, val, header_idxs, money_j = br
             ok = emit(rn, val)

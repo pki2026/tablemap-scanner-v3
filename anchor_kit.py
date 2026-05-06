@@ -1,6 +1,5 @@
 """
-Echtes Desktop-Overlay: Vollbild, topmost, halbtransparent — roter Rahmen liegt über dem Tisch.
-Separates kleines Bedienfenster nur für [Anker speichern] / [Abbrechen].
+Anker: vier dünne topmost Randfenster + 0,0 + Skaliergriff — Desktop bleibt außerhalb bedienbar.
 """
 
 from __future__ import annotations
@@ -22,6 +21,10 @@ ANCHOR_PATCH_PATH = ANCHORS_DIR / "table_anchor_patch.png"
 ANCHOR_CONFIG_PATH = ANCHORS_DIR / "table_anchor_config.json"
 ANCHOR_SCHEMA = "tablemap_scanner_v3_anchor"
 
+THICK = 4
+HANDLE_SZ = 20
+ORIGIN_SZ = 40
+
 
 def _safe_grab_release(w: tk.Misc) -> None:
     try:
@@ -30,56 +33,69 @@ def _safe_grab_release(w: tk.Misc) -> None:
         pass
 
 
-def _destroy_pair(overlay: tk.Toplevel, toolbar: tk.Toplevel | None) -> None:
-    _safe_grab_release(overlay)
-    if toolbar is not None:
-        _safe_grab_release(toolbar)
+def _destroy_windows(ws: list[tk.Misc]) -> None:
+    for w in ws:
         try:
-            toolbar.destroy()
+            _safe_grab_release(w)
+        except Exception:
+            pass
+        try:
+            w.destroy()
         except tk.TclError:
             pass
-    try:
-        overlay.destroy()
-    except tk.TclError:
-        pass
 
 
 def run_anchor_calibration_blocking(root: tk.Tk, *, modal: bool = True) -> bool:
-    """
-    Vollbild-Overlay (Desktop), Rahmen in Bildschirmkoordinaten.
-    Kleines Topmost-Bedienfenster nur für Speichern/Abbrechen.
-    """
-    print("[V3] anchor calibration: true desktop overlay", flush=True)
+    print("[V3] anchor calibration: border frame (non-blocking)", flush=True)
 
     result: dict[str, bool] = {"saved": False, "closing": False}
 
     try:
         sw_i = int(root.winfo_screenwidth())
         sh_i = int(root.winfo_screenheight())
-        print(f"[V3] overlay: screen size {sw_i}x{sh_i}", flush=True)
+        print(f"[V3] anchor frame: screen {sw_i}x{sh_i}", flush=True)
 
-        overlay = tk.Toplevel(root)
+        fw0 = min(480, sw_i - 120)
+        fh0 = min(360, sh_i - 160)
+        frame = {
+            "left": max(40, (sw_i - fw0) // 2),
+            "top": max(40, (sh_i - fh0) // 2),
+            "w": fw0,
+            "h": fh0,
+        }
 
-        overlay.overrideredirect(True)
-        overlay.geometry(f"{sw_i}x{sh_i}+0+0")
-        overlay.attributes("-topmost", True)
-        try:
-            overlay.attributes("-alpha", 0.22)
-            print("[V3] overlay: fullscreen transparent (alpha)", flush=True)
-        except tk.TclError:
-            print("[V3] overlay: alpha not supported, using opaque base", flush=True)
+        interaction: dict[str, int | str | float] = {"mode": "idle"}
 
-        overlay.configure(bg="#000000")
+        def make_red_strip() -> tk.Toplevel:
+            w = tk.Toplevel(root)
+            w.overrideredirect(True)
+            w.attributes("-topmost", True)
+            fr = tk.Frame(w, bg="#ff2020", bd=0, highlightthickness=0)
+            fr.pack(fill=tk.BOTH, expand=True)
+            return w
 
-        canvas = tk.Canvas(
-            overlay,
-            width=sw_i,
-            height=sh_i,
-            highlightthickness=0,
-            bd=0,
-            bg="#000000",
-        )
-        canvas.place(x=0, y=0, width=sw_i, height=sh_i)
+        win_top = make_red_strip()
+        win_bottom = make_red_strip()
+        win_left = make_red_strip()
+        win_right = make_red_strip()
+
+        win_origin = tk.Toplevel(root)
+        win_origin.overrideredirect(True)
+        win_origin.attributes("-topmost", True)
+        win_origin.configure(bg="#0d1a12")
+        tk.Label(
+            win_origin,
+            text="0,0",
+            bg="#0d1a12",
+            fg="#00ff88",
+            font=("Segoe UI", 9, "bold"),
+        ).pack(fill=tk.BOTH, expand=True)
+
+        win_handle = tk.Toplevel(root)
+        win_handle.overrideredirect(True)
+        win_handle.attributes("-topmost", True)
+        hfr = tk.Frame(win_handle, bg="#2a5ad6", bd=1, highlightthickness=1, highlightbackground="#ffffff")
+        hfr.pack(fill=tk.BOTH, expand=True)
 
         tw, th = 460, 72
         tx = max(0, (sw_i - tw) // 2)
@@ -96,193 +112,148 @@ def run_anchor_calibration_blocking(root: tk.Tk, *, modal: bool = True) -> bool:
         btn_row = tk.Frame(bf, bg="#101010")
         btn_row.pack()
 
-        print("[V3] overlay: geometry fullscreen +0+0 (no title bar)", flush=True)
-        print("[V3] overlay: separate toolbar window", flush=True)
-        print("[V3] overlay: widgets created", flush=True)
+        all_wins: list[tk.Toplevel] = [
+            win_top,
+            win_bottom,
+            win_left,
+            win_right,
+            win_origin,
+            win_handle,
+            toolbar,
+        ]
 
-        HANDLE = 18
-        rect_id = 0
-        br_id = 0
-        br_diag1 = 0
-        br_diag2 = 0
-        origin_cross_h = 0
-        origin_cross_v = 0
-        origin_ring = 0
-        origin_label = 0
-        ORIGIN_ARM = 10
+        def sync_geometry() -> None:
+            fl = int(frame["left"])
+            ft = int(frame["top"])
+            fw = int(frame["w"])
+            fh = int(frame["h"])
+            win_top.geometry(f"{fw}x{THICK}+{fl}+{ft}")
+            win_bottom.geometry(f"{fw}x{THICK}+{fl}+{ft + fh - THICK}")
+            win_left.geometry(f"{THICK}x{fh}+{fl}+{ft}")
+            win_right.geometry(f"{THICK}x{fh}+{fl + fw - THICK}+{ft}")
 
-        state: dict[str, float | int | str] = {
-            "mode": "idle",
-            "dx": 0.0,
-            "dy": 0.0,
-            "corner_xoff": 0.0,
-            "corner_yoff": 0.0,
-            "fix_ix": 0,
-            "fix_iy": 0,
-            "w": 400,
-            "h": 300,
-        }
+            ox = max(0, fl - 6)
+            oy = max(0, ft - 6)
+            win_origin.geometry(f"{ORIGIN_SZ}x{ORIGIN_SZ}+{ox}+{oy}")
+            win_handle.geometry(f"{HANDLE_SZ}x{HANDLE_SZ}+{fl + fw - HANDLE_SZ}+{ft + fh - HANDLE_SZ}")
 
-        def clamp_rect(x_: float, y_: float, w_: float, h_: float) -> tuple[int, int, int, int]:
-            cw, ch = sw_i, sh_i
-            w_i, h_i = max(16, min(int(w_), cw)), max(16, min(int(h_), ch))
-            xi, yi = int(x_), int(y_)
-            if xi + w_i > cw:
-                xi = cw - w_i
-            if yi + h_i > ch:
-                yi = ch - h_i
-            xi, yi = max(0, xi), max(0, yi)
-            return xi, yi, w_i, h_i
+            for bw in (win_top, win_bottom, win_left, win_right, win_origin, win_handle):
+                try:
+                    bw.lift()
+                except tk.TclError:
+                    pass
+            try:
+                toolbar.lift()
+            except tk.TclError:
+                pass
 
-        def init_rect_from_canvas() -> None:
-            nonlocal rect_id, br_id, br_diag1, br_diag2
-            nonlocal origin_cross_h, origin_cross_v, origin_ring, origin_label
-            rw_des = min(520, max(160, sw_i - 80))
-            rh_des = min(380, max(120, sh_i - 120))
-            ix0 = max(24, (sw_i - rw_des) // 2)
-            iy0 = max(40, (sh_i - rh_des) // 3)
-            rect_id = canvas.create_rectangle(
-                ix0, iy0, ix0 + rw_des, iy0 + rh_des, outline="#ff2020", width=4
-            )
-            br_id = canvas.create_rectangle(0, 0, HANDLE, HANDLE, outline="#e8f0ff", fill="#2a5ad6", width=2)
-            br_diag1 = canvas.create_line(0, 0, 0, 0, fill="#ffffff", width=2)
-            br_diag2 = canvas.create_line(0, 0, 0, 0, fill="#ffffff", width=2)
-            origin_cross_h = canvas.create_line(0, 0, 0, 0, fill="#00c853", width=3)
-            origin_cross_v = canvas.create_line(0, 0, 0, 0, fill="#00c853", width=3)
-            origin_ring = canvas.create_oval(0, 0, 0, 0, outline="#004d1a", width=2, fill="#b9f6ca")
-            origin_label = canvas.create_text(
-                0, 0, text="0,0", anchor=tk.NW, fill="#00ff88", font=("Segoe UI", 10, "bold")
-            )
-            wx0, wy0, ww0, hh0 = canvas_rect_to_xywh_inner()
-            canvas.coords(rect_id, wx0, wy0, wx0 + ww0, wy0 + hh0)
-            state["w"], state["h"] = ww0, hh0
-
-        def sync_handle() -> None:
-            bx1, by1, bx2, by2 = canvas.coords(rect_id)
-            canvas.coords(br_id, bx2 - HANDLE, by2 - HANDLE, bx2, by2)
-            hx1, hy1, hx2, hy2 = canvas.coords(br_id)
-            canvas.coords(br_diag1, hx1 + 4, hy1 + 4, hx2 - 4, hy2 - 4)
-            canvas.coords(br_diag2, hx1 + 4, hy2 - 4, hx2 - 4, hy1 + 4)
-
-        def sync_origin_marker() -> None:
-            bx1, by1, *_rest = canvas.coords(rect_id)
-            bx1, by1 = float(bx1), float(by1)
-            canvas.coords(origin_cross_h, bx1 - ORIGIN_ARM, by1, bx1 + ORIGIN_ARM, by1)
-            canvas.coords(origin_cross_v, bx1, by1 - ORIGIN_ARM, bx1, by1 + ORIGIN_ARM)
-            pr = 4.0
-            canvas.coords(origin_ring, bx1 - pr, by1 - pr, bx1 + pr, by1 + pr)
-            canvas.coords(origin_label, bx1 + ORIGIN_ARM + 4, by1 + 2)
-
-        def canvas_rect_to_xywh_inner() -> tuple[int, int, int, int]:
-            bx1, by1, bx2, by2 = canvas.coords(rect_id)
-            xa, ya, xb, yb = int(bx1), int(by1), int(bx2), int(by2)
-            if xb <= xa:
-                xb = xa + 16
-            if yb <= ya:
-                yb = ya + 16
-            return clamp_rect(float(xa), float(ya), float(xb - xa), float(yb - ya))
-
-        def apply_rect(ix: int, iy: int, w_: int, h_: int) -> None:
-            canvas.coords(rect_id, ix, iy, ix + w_, iy + h_)
-            sync_handle()
-            sync_origin_marker()
-
-        def on_canvas_down(ev: tk.Event) -> None:
-            cx, cy = canvas.canvasx(ev.x), canvas.canvasy(ev.y)
-            bx1, by1, bx2, by2 = canvas.coords(rect_id)
-            hx1, hy1, hx2, hy2 = canvas.coords(br_id)
-            if hx1 <= cx <= hx2 and hy1 <= cy <= hy2:
-                ix_q, iy_q, w_q, h_q = canvas_rect_to_xywh_inner()
-                state["mode"] = "resize"
-                state["corner_xoff"] = float(cx - bx2)
-                state["corner_yoff"] = float(cy - by2)
-                state["fix_ix"] = ix_q
-                state["fix_iy"] = iy_q
-                state["w"] = w_q
-                state["h"] = h_q
-            elif bx1 <= cx <= bx2 and by1 <= cy <= by2:
-                _, _, wi, hi = canvas_rect_to_xywh_inner()
-                state["mode"] = "move"
-                state["dx"] = cx - bx1
-                state["dy"] = cy - by1
-                state["w"] = wi
-                state["h"] = hi
-            else:
-                state["mode"] = "idle"
-
-        def on_canvas_motion(ev: tk.Event) -> None:
-            cx, cy = canvas.canvasx(ev.x), canvas.canvasy(ev.y)
-            m = str(state["mode"])
-            if m == "move":
-                nx = cx - float(state["dx"])
-                ny = cy - float(state["dy"])
-                ni, nj, nk, nh = clamp_rect(nx, ny, float(state["w"]), float(state["h"]))
-                apply_rect(ni, nj, nk, nh)
-            elif m == "resize":
-                target_x2 = cx - float(state["corner_xoff"])
-                target_y2 = cy - float(state["corner_yoff"])
-                fi, fj = int(state["fix_ix"]), int(state["fix_iy"])
-                br_x, br_y = int(target_x2), int(target_y2)
-                ni, nj, nk, nh = clamp_rect(float(fi), float(fj), float(br_x - fi), float(br_y - fj))
-                apply_rect(ni, nj, nk, nh)
-
-        def on_canvas_release(_ev: tk.Event) -> None:
-            state["mode"] = "idle"
-
-        _initialized = {"ok": False}
-
-        def on_overlay_map(_ev: tk.Event | None = None) -> None:
-            if _initialized["ok"]:
+        def on_border_press(ev: tk.Event) -> None:
+            if str(interaction["mode"]) != "idle":
                 return
-            _initialized["ok"] = True
-            init_rect_from_canvas()
-            sync_handle()
-            sync_origin_marker()
-            canvas.bind("<ButtonPress-1>", on_canvas_down)
-            canvas.bind("<B1-Motion>", on_canvas_motion)
-            canvas.bind("<ButtonRelease-1>", on_canvas_release)
-            print("[V3] overlay: visible (desktop frame ready)", flush=True)
+            interaction["mode"] = "move"
+            interaction["x0"] = int(ev.x_root)
+            interaction["y0"] = int(ev.y_root)
+            interaction["fl0"] = int(frame["left"])
+            interaction["ft0"] = int(frame["top"])
+
+        def on_border_motion(ev: tk.Event) -> None:
+            if str(interaction["mode"]) != "move":
+                return
+            x0 = int(interaction["x0"])
+            y0 = int(interaction["y0"])
+            nl = int(interaction["fl0"]) + int(ev.x_root) - x0
+            nt = int(interaction["ft0"]) + int(ev.y_root) - y0
+            fw = int(frame["w"])
+            fh = int(frame["h"])
+            nl = max(0, min(nl, sw_i - fw))
+            nt = max(0, min(nt, sh_i - fh))
+            frame["left"] = nl
+            frame["top"] = nt
+            sync_geometry()
+
+        def on_handle_press(ev: tk.Event) -> None:
+            if str(interaction["mode"]) != "idle":
+                return
+            interaction["mode"] = "resize"
+            interaction["x0"] = int(ev.x_root)
+            interaction["y0"] = int(ev.y_root)
+            interaction["w0"] = int(frame["w"])
+            interaction["h0"] = int(frame["h"])
+
+        def on_handle_motion(ev: tk.Event) -> None:
+            if str(interaction["mode"]) != "resize":
+                return
+            nw = max(32, int(interaction["w0"]) + int(ev.x_root) - int(interaction["x0"]))
+            nh = max(32, int(interaction["h0"]) + int(ev.y_root) - int(interaction["y0"]))
+            fl = int(frame["left"])
+            ft = int(frame["top"])
+            nw = min(nw, sw_i - fl)
+            nh = min(nh, sh_i - ft)
+            frame["w"] = nw
+            frame["h"] = nh
+            sync_geometry()
+
+        def on_any_release(_ev: tk.Event | None = None) -> None:
+            interaction["mode"] = "idle"
+
+        for w in (win_top, win_bottom, win_left, win_right, win_origin):
+            w.bind("<ButtonPress-1>", on_border_press)
+            w.bind("<B1-Motion>", on_border_motion)
+            w.bind("<ButtonRelease-1>", on_any_release)
+
+        win_handle.bind("<ButtonPress-1>", on_handle_press)
+        win_handle.bind("<B1-Motion>", on_handle_motion)
+        win_handle.bind("<ButtonRelease-1>", on_any_release)
 
         def close_cancel() -> None:
             if result["closing"]:
                 return
             result["closing"] = True
             print("[V3] anchor calibration: cancelled", flush=True)
-            _destroy_pair(overlay, toolbar)
+            _destroy_windows(all_wins)
 
         def save_anchor() -> None:
-            ix, iy, w_, h_ = canvas_rect_to_xywh_inner()
-            if w_ < 8 or h_ < 8:
-                messagebox.showwarning(
-                    "Anker", "Bereich zu klein (min. ca. 8×8 Pixel).", parent=toolbar
-                )
+            fl, ft, fw, fh = (
+                int(frame["left"]),
+                int(frame["top"]),
+                int(frame["w"]),
+                int(frame["h"]),
+            )
+            if fw < 8 or fh < 8:
+                messagebox.showwarning("Anker", "Bereich zu klein.", parent=toolbar)
                 return
-            cx0 = int(canvas.winfo_rootx())
-            cy0 = int(canvas.winfo_rooty())
-            left = cx0 + ix
-            top = cy0 + iy
-            right_ex = left + w_
-            bottom_ex = top + h_
+            left, top = fl, ft
+            right_ex = left + fw
+            bottom_ex = top + fh
             x1, y1, x2, y2 = left, top, right_ex - 1, bottom_ex - 1
-            print(f"[V3] anchor calibration: grab screen bbox left={left} top={top} w={w_} h={h_}", flush=True)
+            print(
+                f"[V3] anchor calibration: grab screen bbox left={left} top={top} right_ex={right_ex} bottom_ex={bottom_ex}",
+                flush=True,
+            )
             try:
-                overlay.withdraw()
-                toolbar.withdraw()
+                for w in all_wins:
+                    try:
+                        w.withdraw()
+                    except tk.TclError:
+                        pass
                 root.update_idletasks()
                 root.update()
                 time.sleep(0.15)
                 try:
-                    im = ImageGrab.grab(bbox=(left, top, right_ex, bottom_ex), all_screens=True)
+                    im = ImageGrab.grab(
+                        bbox=(left, top, right_ex, bottom_ex), all_screens=True
+                    )
                 except TypeError:
                     im = ImageGrab.grab(bbox=(left, top, right_ex, bottom_ex))
             except Exception as ex:
                 traceback.print_exc()
                 print(f"[V3][ERROR] anchor grab failed: {ex}", flush=True)
-                try:
-                    overlay.deiconify()
-                    toolbar.deiconify()
-                except tk.TclError:
-                    pass
+                for w in all_wins:
+                    try:
+                        w.deiconify()
+                    except tk.TclError:
+                        pass
+                sync_geometry()
                 try:
                     messagebox.showerror("Anker", f"Screenshot fehlgeschlagen:\n{ex}", parent=toolbar)
                 except tk.TclError:
@@ -300,10 +271,10 @@ def run_anchor_calibration_blocking(root: tk.Tk, *, modal: bool = True) -> bool:
                     "origin_screen_hint": "top_left_of_rectangle",
                     "resize_handle": "bottom_right",
                     "origin_pixel": {"x": 0, "y": 0},
-                    "anchor_width": w_,
-                    "anchor_height": h_,
+                    "anchor_width": fw,
+                    "anchor_height": fh,
                     "capture_rect_screen": {"x1": x1, "y1": y1, "x2": x2, "y2": y2},
-                    "calibration_mode": "desktop_overlay",
+                    "calibration_mode": "border_frame",
                     "note": "Nullpunkt = oben links im gespeicherten Patch (= linke obere Ecke des Rahmens).",
                 }
                 ANCHOR_CONFIG_PATH.write_text(
@@ -318,41 +289,39 @@ def run_anchor_calibration_blocking(root: tk.Tk, *, modal: bool = True) -> bool:
                     messagebox.showerror("Anker", f"Speichern fehlgeschlagen:\n{ex}", parent=toolbar)
                 except tk.TclError:
                     pass
-                try:
-                    overlay.deiconify()
-                    toolbar.deiconify()
-                except tk.TclError:
-                    pass
+                for w in all_wins:
+                    try:
+                        w.deiconify()
+                    except tk.TclError:
+                        pass
+                sync_geometry()
                 return
 
             result["saved"] = True
             result["closing"] = True
-            _destroy_pair(overlay, toolbar)
+            _destroy_windows(all_wins)
 
         tk.Button(btn_row, text="Abbrechen", command=close_cancel, width=12).pack(side=tk.LEFT, padx=6)
         tk.Button(btn_row, text="Anker speichern", command=save_anchor, width=16).pack(side=tk.LEFT, padx=6)
 
         toolbar.protocol("WM_DELETE_WINDOW", close_cancel)
 
-        overlay.bind("<Map>", on_overlay_map)
-
+        sync_geometry()
         root.update_idletasks()
         root.update()
-        overlay.deiconify()
-        overlay.lift()
-        toolbar.deiconify()
-        toolbar.lift()
-        try:
-            toolbar.focus_force()
-        except Exception:
-            pass
-
-        print("[V3] overlay: entering wait_window", flush=True)
+        for w in all_wins:
+            try:
+                w.deiconify()
+            except tk.TclError:
+                pass
+        sync_geometry()
+        print("[V3] anchor frame: visible (borders + toolbar)", flush=True)
 
         if modal:
-            overlay.wait_window()
+            print("[V3] anchor frame: wait_window(toolbar)", flush=True)
+            toolbar.wait_window()
 
-        print("[V3] overlay: wait_window returned", flush=True)
+        print("[V3] anchor frame: done", flush=True)
         return bool(result.get("saved"))
 
     except Exception as exc:

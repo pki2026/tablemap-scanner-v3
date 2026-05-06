@@ -1098,7 +1098,7 @@ def main() -> int:
     parser.add_argument(
         "--calibrate-anchor",
         action="store_true",
-        help="Transparentes Desktop-Overlay: Anker setzen und beenden (kein Snipping-Modus).",
+        help="Anker per Randfenstern auf dem Desktop setzen (kein Snipping-Modus).",
     )
     args = parser.parse_args()
 

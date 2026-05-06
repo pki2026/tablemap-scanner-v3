@@ -9,19 +9,16 @@ import json
 import re
 import subprocess
 import sys
-import time
 from datetime import datetime
 from pathlib import Path
 
 import tkinter as tk
-from tkinter import messagebox
 
 import win32clipboard
 import win32con
 
 
 POLL_INTERVAL_MS = 500
-TIMEOUT_S = 120
 TOKEN_BBOX = {"x": 0, "y": 0, "w": 100, "h": 20}
 TOKEN_CONFIDENCE = 95
 
@@ -550,28 +547,47 @@ def main() -> int:
 
     root = tk.Tk()
     root.title("Tablemap Scanner V3")
-    root.geometry("800x780")
-    root.minsize(620, 620)
+    root.geometry("520x260")
+    root.minsize(480, 220)
     root.attributes("-topmost", True)
 
+    wait_frame = tk.Frame(root, padx=16, pady=16)
+    wait_frame.pack(fill=tk.BOTH, expand=True)
+
+    tk.Label(wait_frame, text="Tablemap Scanner V3", font=("Segoe UI", 11, "bold")).pack(
+        anchor=tk.CENTER, pady=(0, 6)
+    )
+    tk.Label(
+        wait_frame,
+        text="Warte auf Text aus dem Snipping Tool ...",
+        wraplength=460,
+        justify=tk.CENTER,
+    ).pack(anchor=tk.CENTER, pady=(0, 4))
+    tk.Label(
+        wait_frame,
+        text=(
+            "Bitte im Snipping Tool den Bereich markieren und "
+            "„Text aus Bild kopieren“ klicken."
+        ),
+        wraplength=460,
+        justify=tk.CENTER,
+    ).pack(anchor=tk.CENTER, pady=(0, 14))
+
     def _shutdown() -> None:
+        nonlocal session_done, exit_code
+        if not session_done:
+            session_done = True
+            exit_code = 0
         kill_snipping_process(proc)
         root.destroy()
 
     root.protocol("WM_DELETE_WINDOW", _shutdown)
 
-    status = tk.Label(
-        root,
-        text=(
-            "Bitte Spielfeld im Snipping Tool markieren und "
-            "'Text aus Bild kopieren' klicken."
-        ),
-        wraplength=640,
-        justify=tk.CENTER,
-        padx=12,
-        pady=12,
-    )
-    status.pack(fill=tk.X)
+    tk.Button(
+        wait_frame,
+        text="Scan abbrechen / Beenden",
+        command=_shutdown,
+    ).pack(anchor=tk.CENTER)
 
     def show_results(
         tokens: list[dict],
@@ -580,7 +596,9 @@ def main() -> int:
         out_path: Path,
         clipboard_raw: str,
     ) -> None:
-        status.pack_forget()
+        wait_frame.pack_forget()
+        root.geometry("800x780")
+        root.minsize(620, 620)
         body = tk.Frame(root)
         body.pack(fill=tk.BOTH, expand=True, padx=10, pady=8)
         hdr = tk.Label(
@@ -664,24 +682,10 @@ def main() -> int:
 
     baseline_raw = _read_clipboard_text()
     baseline = _normalize_clip(baseline_raw)
-    start = time.monotonic()
 
     def on_poll() -> None:
         nonlocal session_done, exit_code
         if session_done:
-            return
-
-        elapsed = time.monotonic() - start
-        if elapsed >= TIMEOUT_S:
-            messagebox.showwarning(
-                "Timeout",
-                f"Keine neue Zwischenablage innerhalb von {TIMEOUT_S} Sekunden.",
-                parent=root,
-            )
-            session_done = True
-            exit_code = 1
-            kill_snipping_process(proc)
-            root.destroy()
             return
 
         current_raw = _read_clipboard_text()

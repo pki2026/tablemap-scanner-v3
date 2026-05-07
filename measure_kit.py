@@ -547,6 +547,7 @@ def build_region_boxes(
             "abs": None,
             "rel": None,
             "geometry_status": "unmatched",
+            "geometry_source": "snipping_box",
             "box_layout_zone": None,
             "unmatched_reason": None,
         }
@@ -582,7 +583,8 @@ def build_region_boxes(
         entry["abs"] = dict(boxd["abs"])
         entry["rel"] = dict(boxd["rel"])
         entry["box_layout_zone"] = blz
-        entry["geometry_status"] = "matched"
+        entry["geometry_status"] = "matched_box"
+        entry["geometry_source"] = "snipping_box"
         out.append(entry)
     return out
 
@@ -607,7 +609,7 @@ def save_mapping_debug_image(
 
     box_to_regions: dict[int, list[str]] = {}
     for rb in region_boxes:
-        if rb.get("geometry_status") != "matched":
+        if rb.get("geometry_status") != "matched_box":
             continue
         bi = rb.get("box_index")
         if bi is None:

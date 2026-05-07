@@ -27,6 +27,7 @@ from measure_kit import (
     map_tokens_to_boxes_many_to_one,
     save_mapping_debug_image,
 )
+from text_pixel_origin import measure_text_pixel_origins
 
 import win32clipboard
 import win32con
@@ -1357,6 +1358,9 @@ def main() -> int:
         order = sorted_region_names(aggregate_by_region.keys())
         regions_flat = {name: aggregate_by_region[name]["value"] for name in order}
         last_regions_by_name = {r["region_name"]: r for r in (scans[-1].get("regions") or [])}
+        last_tp_by_region = (
+            dict(scans[-1].get("text_pixel_by_region") or {}) if scans else {}
+        )
         regions_detail: list[dict] = []
         for name in order:
             row = {
@@ -1368,6 +1372,21 @@ def main() -> int:
             row["source_token_indices"] = (
                 list(lr.get("source_token_indices", [])) if lr else []
             )
+            tp = last_tp_by_region.get(name)
+            if tp:
+                row["text_origin_abs"] = tp.get("text_origin_abs")
+                row["text_origin_rel"] = tp.get("text_origin_rel")
+                row["text_bbox_abs"] = tp.get("text_bbox_abs")
+                row["text_bbox_rel"] = tp.get("text_bbox_rel")
+                row["geometry_status"] = tp.get("geometry_status", "text_pixels_not_found")
+                row["geometry_source"] = tp.get("geometry_source", "text_pixel_origin")
+            else:
+                row["text_origin_abs"] = None
+                row["text_origin_rel"] = None
+                row["text_bbox_abs"] = None
+                row["text_bbox_rel"] = None
+                row["geometry_status"] = "text_pixels_not_found"
+                row["geometry_source"] = "text_pixel_origin"
             regions_detail.append(row)
         region_summary = compute_region_summary(region_history, aggregate_by_region)
         rh_order = sorted_region_names(region_history.keys())
@@ -1395,6 +1414,7 @@ def main() -> int:
         payload["snipping_text_boxes_latest"] = last_scan.get("snipping_text_boxes")
         payload["region_boxes_latest"] = last_scan.get("region_boxes")
         payload["token_box_map_latest"] = last_scan.get("token_box_map")
+        payload["text_pixel_by_region_latest"] = last_scan.get("text_pixel_by_region")
         out_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
         print("[V3] final export written:", out_path, flush=True)
 
@@ -1488,7 +1508,7 @@ def main() -> int:
         if scans:
             ls0 = scans[-1]
             for rb in ls0.get("region_boxes") or []:
-                if rb.get("geometry_status") == "matched":
+                if rb.get("geometry_status") == "matched_box":
                     rel = rb.get("rel") or {}
                     rb_ok.append(
                         f"{rb['region_name']} → {rb['value']} → box {rb['box_index']} → "
@@ -1936,13 +1956,53 @@ def main() -> int:
             )
             if dbg_p is not None:
                 print(f"[V3] mapping debug: {dbg_p}", flush=True)
-            n_matched = sum(1 for rb in region_boxes if rb.get("geometry_status") == "matched")
+            n_matched_box = sum(
+                1 for rb in region_boxes if rb.get("geometry_status") == "matched_box"
+            )
             print(
-                f"[V3] measure map: confidence={map_bundle['mapping_confidence']} "
+                f"[V3] measure map (diagnostic boxes only): confidence={map_bundle['mapping_confidence']} "
                 f"boxes_total={len(geom['snipping_text_boxes'])} usable={len(usable_boxes)} "
-                f"ignored={len(ignored_boxes)} region_boxes_matched={n_matched}",
+                f"ignored={len(ignored_boxes)} region_boxes_matched_box={n_matched_box}",
                 flush=True,
             )
+            print("[V3] text pixel origin measurement started", flush=True)
+            cap_path = str(Path(geom["marked_capture"]["path"]).resolve())
+            anc = geom["anchor"]
+            anchor_xy = {"x": int(anc["x"]), "y": int(anc["y"])}
+            text_pixel_input = [
+                {"region_name": x["region_name"], "value": x["value"]} for x in regions
+            ]
+            print(f"[V3] text pixel regions input: {len(text_pixel_input)}", flush=True)
+            text_pixel_by_region = measure_text_pixel_origins(
+                cap_path,
+                anchor_xy,
+                text_pixel_input,
+                region_zone_hints=None,
+            )
+            n_tp_ok = sum(
+                1
+                for _rn, g in text_pixel_by_region.items()
+                if g.get("geometry_status") == "matched_text_pixels"
+            )
+            n_tp_fail = len(text_pixel_input) - n_tp_ok
+            print(f"[V3] text pixel regions matched: {n_tp_ok}", flush=True)
+            print(f"[V3] text pixel regions failed: {n_tp_fail}", flush=True)
+            print("[V3] box mapping ignored for final geometry", flush=True)
+            for _rn, g in sorted(text_pixel_by_region.items(), key=lambda t: region_sort_key(t[0])):
+                val_echo = g.get("value", "")
+                st = g.get("geometry_status")
+                rel = g.get("text_origin_rel") or {}
+                rx, ry = rel.get("x"), rel.get("y")
+                if st == "matched_text_pixels" and rx is not None and ry is not None:
+                    print(
+                        f"[V3] text origin matched: {_rn} value={val_echo!r} rel=({rx},{ry})",
+                        flush=True,
+                    )
+                elif st == "text_pixels_not_found":
+                    print(
+                        f"[V3] text origin failed: {_rn} value={val_echo!r}",
+                        flush=True,
+                    )
             regions_snapshot = [
                 {
                     "region_name": x["region_name"],
@@ -1972,6 +2032,7 @@ def main() -> int:
                     "region_boxes": region_boxes,
                     "regions": regions_snapshot,
                     "mapping_debug_image": str(dbg_p.resolve()) if dbg_p else None,
+                    "text_pixel_by_region": text_pixel_by_region,
                 }
             )
             pending_geometry = None
